@@ -321,6 +321,18 @@ def detect_finance(doc):
             seen.add(k)
             clean_rows.append(r)
 
+    # Exact numeric values in the single "Pagamento:" summary line.
+    # We replace only these numbers, preserving the original labels/text.
+    summary_amounts = []
+    for bl in blocks:
+        if "Pagamento:" not in bl[4]:
+            continue
+        for w in words:
+            if is_money_number(w[4]) and bl[1] <= w[1] <= bl[3] and w[1] < 361:
+                summary_amounts.append({"rect": rect_from_word(w, 1), "x": w[0]})
+        break
+    summary_amounts.sort(key=lambda r: r["x"])
+
     return {
         "page": page_index,
         "total_rect": rect_from_word(total_w, 1) if total_w else None,
@@ -334,6 +346,7 @@ def detect_finance(doc):
         "condition_rect": condition_rect,
         "payment_rect": payment_rect,
         "payment_rows": clean_rows,
+        "summary_amounts": summary_amounts,
         "frete": parse_number(frete_w[4]) if frete_w else 0,
         "desconto": parse_number(desc_w[4]) if desc_w else 0,
         "liquido": parse_number(liquid_w[4]) if liquid_w else 0,
@@ -441,18 +454,11 @@ def generate_pdf(pdf_bytes, d):
                 remaining=round(remaining-amount,2)
             amounts.append(amount)
 
-        # Replace the entire Pagamento summary line, including ALL old values.
-        if f.get("payment_rect"):
-            old=fitz.Rect(f["payment_rect"])
-            rect=fitz.Rect(old.x0-1,old.y0-1,560,old.y1+1)
-            fp.add_redact_annot(rect,fill=(1,1,1))
-            fp.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-            parts=[]
-            for i,amount in enumerate(amounts):
-                parts.append(("Entrada" if i==0 else f"{i}x")+f" R$ {money(amount)}")
-            fp.insert_textbox(rect,"Pagamento: "+" + ".join(parts),
-                              fontname="hebo",fontsize=7.5,color=(0,0,0),
-                              align=0,lineheight=1.0,overlay=True)
+        # Replace ONLY the three numeric amounts in the existing Pagamento line.
+        # Keep "Pagamento:", "Entrada", "1x", plus signs, etc. exactly as Pontta printed them.
+        summary_rects = f.get("summary_amounts", [])
+        for rect_info, amount in zip(summary_rects[:n], amounts):
+            replace_word(fp, rect_info["rect"], money(amount), "hebo", 7.5, align=0)
 
         # Replace all table amounts from the original coordinates.
         for row,amount in zip(rows[:n],amounts):
