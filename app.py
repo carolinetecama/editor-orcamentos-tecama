@@ -378,6 +378,19 @@ def update_payment_text(page, rect, new_text):
     page.insert_textbox(rect, new_text, fontname="helv", fontsize=7.5,
                         color=(0,0,0), align=0, lineheight=1.0, overlay=True)
 
+def parse_payment_percentages(condition):
+    """Read the payment percentages from Pontta conditions like:
+    34% Sinal + 33 a 28 DDF + 33% a 56 DDF
+    The middle installment intentionally may omit the % sign.
+    """
+    parts = [p.strip() for p in str(condition).split("+") if p.strip()]
+    vals = []
+    for part in parts:
+        m = re.match(r"^(\d+(?:[.,]\d+)?)", part)
+        if m:
+            vals.append(float(m.group(1).replace(",", ".")))
+    return vals
+
 def generate_pdf(pdf_bytes, d):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     p0 = doc[0]
