@@ -165,101 +165,98 @@ def detect_header(page):
     }
 
 def detect_items(doc):
-    """Detect product rows from Pontta item blocks.
-
-    Pontta can put the first line of an item's description a few points above
-    the quantity/price line (and may wrap the description onto another line).
-    Therefore item detection is based on the complete PDF text block containing
-    quantity + UN + the two price values, rather than requiring all words to
-    share one Y coordinate.
     """
-    items = []
+    Detect each product from the Pontta table using the Qtd. row as the anchor.
+    This is deliberately coordinate-based instead of block-based because
+    Pontta may put the description on several lines and prices in separate
+    PDF text objects.
+    """
+    items=[]
     for page_index, page in enumerate(doc):
-        words = page.get_text("words")
-        blocks = page.get_text("blocks")
+        words=page.get_text("words")
 
-        for bl in blocks:
-            x0, y0, x1, y1, txt = bl[:5]
-            if "R$" not in txt or "UN" not in txt:
+        # Quantity anchors: "1 UN", "2 UN", etc.
+        qty_words=[w for w in words if w[4].upper()=="UN" and 15 <= w[0] <= 80]
+        for un_w in qty_words:
+            # Find numeric quantity immediately before UN.
+            q_candidates=[w for w in words if abs(w[1]-un_w[1])<=2.5 and 15<=w[2]<=un_w[0]+1 and re.fullmatch(r"\d+(?:[.,]\d+)?",w[4])]
+            if not q_candidates:
                 continue
-            if not re.search(r"\b\d+(?:[.,]\d+)?\s+UN\b", txt, flags=re.I):
-                continue
+            q_w=max(q_candidates,key=lambda w:w[2])
+            qty=float(q_w[4].replace(",", "."))
+            qty_value=int(qty) if qty.is_integer() else qty
+            y=un_w[1]
 
-            # Price words belonging to this block.
-            bw = [w for w in words if w[0] >= x0-1 and w[2] <= x1+1 and w[1] >= y0-1 and w[3] <= y1+1]
-            price_words = [w for w in bw if is_money_number(w[4])]
-            if len(price_words) < 2:
-                continue
-
-            # In Pontta the unit and total columns are the two right-most
-            # monetary values in an item block.
-            price_words.sort(key=lambda w: (w[1], w[0]))
-            # Prefer the pair with the expected column positions.
-            unit_candidates = [w for w in price_words if 400 <= w[0] <= 500]
-            total_candidates = [w for w in price_words if 515 <= w[0] <= 590]
+            # Price pair near the quantity row. Price text can be in a
+            # separate PDF text object, so search by coordinates, not block.
+            unit_candidates=[
+                w for w in words
+                if is_money_number(w[4]) and 400 <= w[0] <= 505 and abs(w[1]-y)<=4
+            ]
+            total_candidates=[
+                w for w in words
+                if is_money_number(w[4]) and 515 <= w[0] <= 590 and abs(w[1]-y)<=4
+            ]
             if not unit_candidates or not total_candidates:
                 continue
-            unit_w = sorted(unit_candidates, key=lambda w:(w[1],w[0]))[0]
-            total_w = sorted(total_candidates, key=lambda w:(w[1],w[0]))[0]
+            unit_w=min(unit_candidates,key=lambda w:abs(w[1]-y))
+            total_w=min(total_candidates,key=lambda w:abs(w[1]-y))
 
-            # Quantity.
-            qm = re.search(r"\b(\d+(?:[.,]\d+)?)\s+UN\b", txt, flags=re.I)
-            if not qm:
-                continue
-            qty = float(qm.group(1).replace(",", "."))
-            if not qty.is_integer():
-                # Keep support for decimal quantities without inventing an
-                # integer quantity for the calculation.
-                qty_value = qty
-            else:
-                qty_value = int(qty)
+            # Description: collect words in the item column around the
+            # quantity row, allowing the first description to wrap.
+            # Stop before the configuration paragraph below the item.
+            desc_words=[]
+            for w in words:
+                if not (125 <= w[0] < 415):
+                    continue
+                if y-12 <= w[1] <= y+5:
+                    t=w[4]
+                    if t not in {"R$"} and not is_money_number(t):
+                        desc_words.append(w)
 
-            # Description is the line(s) in this block between the quantity
-            # and the price columns. Remove quantity/UN and price tokens.
-            lines = [re.sub(r"\s+", " ", ln).strip() for ln in txt.splitlines() if ln.strip()]
-            desc_parts = []
-            for line in lines:
-                line = re.sub(r"^\d+(?:[.,]\d+)?\s+UN\s*", "", line, flags=re.I)
-                line = re.sub(r"R\$\s*[\d.]+,\d{2}", "", line)
-                line = re.sub(r"\b[\d.]+,\d{2}\b", "", line)
-                line = re.sub(r"\s+", " ", line).strip(" -")
-                if line and not re.fullmatch(r"(?:R\$\s*)+", line):
-                    desc_parts.append(line)
-            description = " ".join(desc_parts).strip()
+            # First item may have a wrapped second line at y+5.5 to +15.
+            for w in words:
+                if not (125 <= w[0] < 415):
+                    continue
+                if y+5 < w[1] <= y+16:
+                    t=w[4]
+                    if t not in {"R$"} and not is_money_number(t):
+                        desc_words.append(w)
+
+            desc_words.sort(key=lambda w:(w[1],w[0]))
+            description=" ".join(w[4] for w in desc_words).strip()
+            # Remove accidental header/configuration tokens if any.
+            if "Configuração" in description:
+                description=description.split("Configuração",1)[0].strip()
+
             if not description:
-                # Fall back to words in the item-description column.
-                desc_words = [w for w in bw if 120 <= w[0] < 410 and w[4] not in {"R$", "UN"}]
-                description = " ".join(w[4] for w in sorted(desc_words, key=lambda w:(w[1],w[0]))).strip()
-            if not description:
                 continue
 
-            # Avoid accidentally treating finance/payment blocks as products.
-            if any(k in description.lower() for k in ["condição:", "pagamento:", "descontos", "valor líquido"]):
+            # Do not treat payment/finance rows as products.
+            low=description.lower()
+            if any(k in low for k in ["condição:", "pagamento:", "descontos", "valor líquido"]):
                 continue
 
             items.append({
-                "page": page_index,
-                "y": y0,
-                "qty": qty_value,
-                "description": description,
-                "unit": parse_number(unit_w[4]),
-                "total": parse_number(total_w[4]),
-                "unit_rect": rect_from_word(unit_w, 1),
-                "total_rect": rect_from_word(total_w, 1),
+                "page":page_index,
+                "y":y,
+                "qty":qty_value,
+                "description":description,
+                "unit":parse_number(unit_w[4]),
+                "total":parse_number(total_w[4]),
+                "unit_rect":rect_from_word(unit_w,1),
+                "total_rect":rect_from_word(total_w,1),
             })
 
-    # Remove duplicates caused by a PDF producer splitting one item into
-    # overlapping blocks, then preserve page/vertical order.
-    unique = []
-    seen = set()
-    for item in sorted(items, key=lambda x:(x["page"], x["y"], x["unit"])):
-        key = (item["page"], round(item["y"], 1), round(item["unit"], 2), round(item["total"], 2))
-        if key in seen:
-            continue
+    # Deduplicate using quantity row + description.
+    unique=[]
+    seen=set()
+    for item in sorted(items,key=lambda x:(x["page"],x["y"])):
+        key=(item["page"],round(item["y"],1),item["description"])
+        if key in seen: continue
         seen.add(key)
         unique.append(item)
     return unique
-
 
 def detect_finance(doc):
     page_index=len(doc)-1
@@ -476,6 +473,12 @@ uploaded = st.file_uploader("Envie o orçamento original exportado do Pontta", t
 
 if uploaded:
     pdf_bytes = uploaded.getvalue()
+    import hashlib
+    upload_signature = hashlib.sha256(pdf_bytes).hexdigest()
+    if st.session_state.get("_upload_signature") != upload_signature:
+        st.session_state["_upload_signature"] = upload_signature
+        st.session_state.pop("result_pdf", None)
+        st.session_state.pop("result_name", None)
     try:
         parsed = parse_pdf(pdf_bytes)
     except Exception as e:
@@ -483,6 +486,10 @@ if uploaded:
         st.stop()
 
     st.success(f"Encontrados {len(parsed['items'])} item(ns) em {parsed['doc_pages']} página(s).")
+
+    if not parsed["items"]:
+        st.error("Não consegui localizar os itens deste PDF. Nenhum PDF será gerado para evitar alterar o orçamento incorretamente.")
+        st.stop()
 
     with st.form("editor"):
         st.subheader("Consultor de vendas")
@@ -505,7 +512,8 @@ if uploaded:
             with b:
                 st.write(f"{item['qty']} UN")
             with c:
-                unit = st.text_input("Valor unitário", money(item["unit"]), key=f"unit_{i}")
+                item_key = f"unit_{item["page"]}_{round(item["y"])}_{i}"
+                unit = st.text_input("Valor unitário", money(item["unit"]), key=item_key)
             edited_items.append({**item, "unit": unit})
 
         st.subheader("Financeiro")
