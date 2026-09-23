@@ -255,83 +255,65 @@ def detect_finance(doc):
     desc_w = value_after_rs_near_label("Descontos")
     liquid_w = value_after_rs_near_label("líquido")
 
-    # Exact discount percentage token.
     pct_w = None
     desc_labels = [w for w in words if w[4].lower().startswith("descont")]
     if desc_labels:
         dl = desc_labels[0]
-        pct_candidates = [
-            w for w in words
-            if abs(w[1]-dl[1]) <= 4 and re.fullmatch(r"\(\d+(?:,\d+)?%\)", w[4])
-        ]
+        pct_candidates = [w for w in words if abs(w[1]-dl[1]) <= 4 and re.fullmatch(r"\(\d+(?:,\d+)?%\)", w[4])]
         if pct_candidates:
             pct_w = sorted(pct_candidates, key=lambda w:w[0])[0]
 
     blocks = page.get_text("blocks")
     condition = ""
     payment = ""
-    condition_rect = None
-    payment_rect = None
+    condition_blocks = []
+    payment_blocks = []
 
     for bl in blocks:
         txt = bl[4].strip()
         if txt.startswith("Condição:"):
-            condition = txt.splitlines()[0].replace("Condição:", "", 1).strip()
-            condition_rect = fitz.Rect(bl[0], bl[1], bl[2], bl[3])
+            if not condition:
+                condition = txt.splitlines()[0].replace("Condição:", "", 1).strip()
+            condition_blocks.append(fitz.Rect(bl[0], bl[1], bl[2], bl[3]))
         elif txt.startswith("Pagamento:"):
-            payment = txt.splitlines()[0].replace("Pagamento:", "", 1).strip()
-            payment_rect = fitz.Rect(bl[0], bl[1], bl[2], bl[3])
+            if not payment:
+                payment = txt.splitlines()[0].replace("Pagamento:", "", 1).strip()
+            payment_blocks.append(fitz.Rect(bl[0], bl[1], bl[2], bl[3]))
 
-    # The table has exactly one amount after each R$ on the same row.
-    # Detect by the payment dates, which are stable even when values change.
+    # Existing payment-summary amounts. We NEVER redraw this line; we only
+    # replace the numeric words already present in the original PDF.
+    summary_groups = []
+    for rect in payment_blocks:
+        vals = []
+        for w in words:
+            if is_money_number(w[4]) and rect.y0 - 1 <= w[1] <= rect.y1 + 1 and w[0] >= rect.x0 - 1:
+                vals.append({"rect": rect_from_word(w, 1), "x": w[0], "y": w[1]})
+        vals.sort(key=lambda r:r["x"])
+        if vals:
+            summary_groups.append(vals)
+
+    # Payment table amounts: locate by date rows.
     payment_rows = []
     for date_w in words:
         if not re.fullmatch(r"\d{2}/\d{2}/\d{4}", date_w[4]):
             continue
         y = date_w[1]
-        rs_candidates = [
-            w for w in words
-            if w[4] == "R$" and abs(w[1]-y) <= 1.5 and w[0] > 175 and w[0] < 210
-        ]
+        rs_candidates = [w for w in words if w[4] == "R$" and abs(w[1]-y) <= 1.5 and w[0] > 175 and w[0] < 210]
         if not rs_candidates:
             continue
         rs_w = min(rs_candidates, key=lambda w:w[0])
-        amount_candidates = [
-            w for w in words
-            if is_money_number(w[4]) and abs(w[1]-y) <= 1.5 and w[0] > rs_w[2] and w[0] < 245
-        ]
+        amount_candidates = [w for w in words if is_money_number(w[4]) and abs(w[1]-y) <= 1.5 and w[0] > rs_w[2] and w[0] < 245]
         if not amount_candidates:
             continue
         amount_w = min(amount_candidates, key=lambda w:w[0])
-        payment_rows.append({
-            "page": page_index,
-            "amount": parse_number(amount_w[4]),
-            "rect": rect_from_word(amount_w, 1),
-            "date": date_w[4],
-            "y": y,
-        })
+        payment_rows.append({"page": page_index, "amount": parse_number(amount_w[4]), "rect": rect_from_word(amount_w, 1), "date": date_w[4], "y": y})
 
     payment_rows.sort(key=lambda r:r["y"])
-    # De-duplicate by row Y.
-    clean_rows = []
-    seen = set()
+    clean_rows=[]; seen=set()
     for r in payment_rows:
-        k = round(r["y"], 1)
+        k=round(r["y"],1)
         if k not in seen:
-            seen.add(k)
-            clean_rows.append(r)
-
-    # Exact numeric values in the single "Pagamento:" summary line.
-    # We replace only these numbers, preserving the original labels/text.
-    summary_amounts = []
-    for bl in blocks:
-        if "Pagamento:" not in bl[4]:
-            continue
-        for w in words:
-            if is_money_number(w[4]) and bl[1] <= w[1] <= bl[3] and w[1] < 361:
-                summary_amounts.append({"rect": rect_from_word(w, 1), "x": w[0]})
-        break
-    summary_amounts.sort(key=lambda r: r["x"])
+            seen.add(k); clean_rows.append(r)
 
     return {
         "page": page_index,
@@ -343,10 +325,10 @@ def detect_finance(doc):
         "desconto_pct": re.sub(r"[()%]", "", pct_w[4]) if pct_w else "",
         "condition": condition,
         "payment": payment,
-        "condition_rect": condition_rect,
-        "payment_rect": payment_rect,
+        "condition_blocks": condition_blocks,
+        "payment_blocks": payment_blocks,
+        "summary_groups": summary_groups,
         "payment_rows": clean_rows,
-        "summary_amounts": summary_amounts,
         "frete": parse_number(frete_w[4]) if frete_w else 0,
         "desconto": parse_number(desc_w[4]) if desc_w else 0,
         "liquido": parse_number(liquid_w[4]) if liquid_w else 0,
@@ -445,57 +427,34 @@ def generate_pdf(pdf_bytes, d):
         replace_word(fp, f["desconto_pct_rect"], pct_text, "helv", 8.0, align=2)
     replace_word(fp, f["liquido_rect"], money(liquido), "hebo", 8.3, align=2)
 
-    # 4) Pagamento — NÃO editar pedaços individuais da linha.
-    # O PDF do Pontta coloca a linha 'Condição' imediatamente acima de
-    # 'Pagamento', com caixas de texto que se sobrepõem verticalmente.
-    # Redigir apenas o bloco inteiro e redesenhar as duas linhas evita
-    # apagar a parte inferior da linha 'Condição'.
+    # 4) Pagamento
+    # IMPORTANT: do not create a new Condition/Pagamento block.
+    # The Pontta template moves this block depending on the number of items.
+    # We preserve its original position and replace only existing numbers.
     condition = d["condition"]
     percents = parse_payment_percentages(condition)
     rows = f.get("payment_rows", [])
 
     if percents and rows:
         n = min(len(percents), len(rows))
-        amounts = []
-        remaining = liquido
+        amounts=[]; remaining=liquido
         for i in range(n):
-            if i == n - 1:
-                amount = round(remaining, 2)
+            if i == n-1:
+                amount=round(remaining,2)
             else:
-                amount = round(liquido * percents[i] / 100, 2)
-                remaining = round(remaining - amount, 2)
+                amount=round(liquido*percents[i]/100,2)
+                remaining=round(remaining-amount,2)
             amounts.append(amount)
 
-        # Atualiza a tabela inferior primeiro, nas posições originais.
+        # Update the payment table.
         for row, amount in zip(rows[:n], amounts):
             replace_word(fp, row["rect"], money(amount), "helv", 7.6, align=2)
 
-        # Redesenha somente o bloco das duas linhas de condição/pagamento.
-        # Coordenadas são relativas ao template Pontta e deixam a tabela abaixo intacta.
-        block = fitz.Rect(20.5, 333.8, 555.0, 359.3)
-        fp.add_redact_annot(block, fill=(1, 1, 1))
-        fp.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-
-        # Mantém a condição original exatamente como o usuário recebeu.
-        fp.insert_text(
-            (21.68, 344.78),
-            f"Condição: {condition}",
-            fontname="hebo", fontsize=9.0,
-            color=(0,0,0), overlay=True
-        )
-
-        # Mantém a estrutura textual do Pontta e troca somente os valores.
-        pieces = [f"Entrada R$ {money(amounts[0])}"]
-        for i, amount in enumerate(amounts[1:], 1):
-            pieces.append(f"1x R$ {money(amount)}")
-        payment_text = "Pagamento: " + " + ".join(pieces)
-
-        fp.insert_text(
-            (21.68, 355.50),
-            payment_text,
-            fontname="hebo", fontsize=9.0,
-            color=(0,0,0), overlay=True
-        )
+        # Update every existing "Pagamento:" summary line in place.
+        # No labels, dates or condition text are touched.
+        for group in f.get("summary_groups", []):
+            for rect_info, amount in zip(group[:n], amounts):
+                replace_word(fp, rect_info["rect"], money(amount), "hebo", 7.5)
 
     out = io.BytesIO()
     doc.save(out, garbage=4, deflate=True)
