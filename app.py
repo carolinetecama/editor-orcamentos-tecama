@@ -40,83 +40,154 @@ def first(pattern, text, default=""):
 def parse_pdf(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]
-    blocks = page.get_text("blocks")
+    words = page.get_text("words")
 
-    def block_at(y1, y2, x1=0, x2=595):
-        candidates = []
-        for b in blocks:
-            x0, top, x_1, bottom, txt = b[:5]
-            if top >= y1 and bottom <= y2 and x_1 >= x1 and x0 <= x2:
-                candidates.append((top, txt))
-        candidates.sort()
-        return "\n".join(t for _, t in candidates).strip()
+    def text_in_rect(rect):
+        x0, y0, x1, y1 = rect
+        selected = []
+        for w in words:
+            wx0, wy0, wx1, wy1, txt = w[:5]
+            if wx1 >= x0 and wx0 <= x1 and wy1 >= y0 and wy0 <= y1:
+                selected.append((wy0, wx0, txt))
+        selected.sort()
+        return " ".join(t for _, _, t in selected)
 
-    top = block_at(0, 35)
-    client = block_at(145, 181)
-    client2 = block_at(181, 225)
-    delivery = block_at(235, 272)
-    partner = block_at(270, 296)
-    item1 = block_at(345, 375)
-    item2 = block_at(438, 460)
-    finance = block_at(495, 568)
-    payment = block_at(567, 592)
-    payment_row = block_at(605, 624)
+    # Header
+    top = text_in_rect((0, 0, 595, 35))
+    header = text_in_rect((150, 105, 380, 132))
+    client = text_in_rect((10, 145, 590, 185))
+    client2 = text_in_rect((10, 181, 590, 225))
+    delivery = text_in_rect((10, 232, 590, 275))
+    partner = text_in_rect((10, 275, 590, 298))
 
     data = {}
-    m = re.search(r"^(\d{2}/\d{2}/\d{4})", top)
+
+    m = re.search(r"(\d{2}/\d{2}/\d{4})", top)
     data["data"] = m.group(1) if m else ""
     m = re.search(r"Orçamento\s+([A-Z0-9\-]+)", top, re.I)
     data["orcamento"] = m.group(1) if m else ""
 
+    # The label "CONSULTOR DE VENDAS:" remains untouched; only the name is editable.
+    m = re.search(r"VENDAS:\s*(.+)", header, re.I)
+    data["consultor"] = m.group(1).strip() if m else ""
+
     client_lines = [x.strip() for x in client.splitlines() if x.strip()]
-    data["cliente"] = client_lines[1] if len(client_lines) >= 2 else ""
+    data["cliente"] = ""
+    for line in client_lines:
+        if not line.upper().startswith("CLIENTE:") and not re.fullmatch(r"\(\d{2}\)\s*\d{4,5}-\d{4}", line):
+            if len(line) > 3:
+                data["cliente"] = line
+                break
     m = re.search(r"(\(\d{2}\)\s*\d{4,5}-\d{4})", client)
     data["telefone_cliente"] = m.group(1) if m else ""
 
-    client2_lines = [x.strip() for x in client2.splitlines() if x.strip()]
-    m = re.search(r"CNPJ:\s*([\d./-]+)", client2)
+    m = re.search(r"CNPJ:\s*([\d./-]+)", client2, re.I)
     data["cnpj"] = m.group(1) if m else ""
-    if client2_lines:
-        data["endereco_cliente"] = client2_lines[-1]
-    else:
-        data["endereco_cliente"] = ""
+    # Address is the line after CNPJ in this template.
+    lines2 = [x.strip() for x in client2.splitlines() if x.strip()]
+    data["endereco_cliente"] = lines2[-1] if lines2 else ""
 
-    m = re.search(r"Validade:\s*(\d{2}/\d{2}/\d{4})", delivery)
+    m = re.search(r"Validade:\s*(\d{2}/\d{2}/\d{4})", delivery, re.I)
     data["validade"] = m.group(1) if m else ""
-    m = re.search(r"Previsão de entrega:\s*(\d{2}/\d{2}/\d{4})", delivery)
+    m = re.search(r"Previsão de entrega:\s*(\d{2}/\d{2}/\d{4})", delivery, re.I)
     data["entrega"] = m.group(1) if m else ""
-    m = re.search(r"Endereço de entrega:\s*(.+)", delivery)
+    m = re.search(r"Endereço de entrega:\s*(.+)", delivery, re.I)
     data["endereco_entrega"] = m.group(1).strip() if m else ""
 
-    partner_lines = [x.strip() for x in partner.splitlines() if x.strip()]
-    data["parceiro"] = " ".join(partner_lines[1:]) if len(partner_lines) > 1 else ""
+    # Keep the partner field as the partner line, without trying to edit its email/phone.
+    partner_clean = re.sub(r"^Parceiros?\s*", "", partner, flags=re.I).strip()
+    data["parceiro"] = partner_clean
 
-    def item_parse(txt):
-        lines = [re.sub(r"\s+", " ", x).strip() for x in txt.splitlines() if x.strip()]
-        desc = ""
-        vals = []
-        for line in lines:
-            m = re.search(r"R\$\s*([\d.]+,\d{2})", line)
-            if m:
-                vals.append(m.group(1))
-            elif not re.fullmatch(r"\d+\s+UN", line, re.I):
-                desc = (desc + " " + line).strip()
-        return desc, vals[0] if vals else ""
+    # Detect every product price row from the original PDF.
+    # A product row has TWO R$ tokens at approximately the same Y:
+    # one in "Valor unitário" and one in "Total".
+    price_rows = []
+    rs_words = [w for w in words if w[4] == "R$" and 400 < w[0] < 590]
+    for i, rs1 in enumerate(rs_words):
+        x0, y0, x1, y1, txt = rs1[:5]
+        if not (420 <= x0 <= 450):
+            continue
+        candidates = []
+        for rs2 in rs_words:
+            if rs2 is rs1:
+                continue
+            x20, y20, x21, y21, _ = rs2[:5]
+            if 515 <= x20 <= 540 and abs(y20 - y0) <= 3:
+                candidates.append(rs2)
+        if not candidates:
+            continue
+        rs2 = min(candidates, key=lambda w: abs(w[1] - y0))
 
-    data["item1_desc"], data["item1_unit"] = item_parse(item1)
-    data["item2_desc"], data["item2_unit"] = item_parse(item2)
+        # Find the numeric word immediately following each R$.
+        nums = []
+        for rs in (rs1, rs2):
+            rx1, ry0 = rs[2], rs[1]
+            following = [
+                w for w in words
+                if w[0] >= rx1 - 1 and w[1] >= ry0 - 1 and w[1] <= ry0 + 3
+                and re.fullmatch(r"[\d.]+,\d{2}", w[4])
+            ]
+            if following:
+                nums.append(min(following, key=lambda w: w[0]))
+            else:
+                nums.append(None)
 
-    m = re.search(r"Total\s*\nR\$\s*([\d.]+,\d{2})", finance, re.I)
-    data["total"] = m.group(1) if m else ""
-    m = re.search(r"Frete\s*\n\+\s*R\$\s*([\d.]+,\d{2})", finance, re.I)
+        if len(nums) != 2 or any(n is None for n in nums):
+            continue
+
+        # Quantity from the left side of the same row.
+        qty = 1
+        qty_candidates = [
+            w for w in words
+            if w[0] < 70 and abs(w[1] - y0) <= 3 and re.fullmatch(r"\d+", w[4])
+        ]
+        if qty_candidates:
+            try:
+                qty = int(qty_candidates[0][4])
+            except ValueError:
+                qty = 1
+
+        # Description from the item column around this Y, limited to before the configuration text.
+        desc_words = [
+            w for w in words
+            if 140 <= w[0] <= 410 and abs(w[1] - y0) <= 18
+        ]
+        desc_words.sort(key=lambda w: (w[1], w[0]))
+        desc = " ".join(w[4] for w in desc_words)
+        desc = re.sub(r"\s+", " ", desc).strip()
+
+        price_rows.append({
+            "y": y0,
+            "qty": qty,
+            "description": desc,
+            "unit": nums[0][4],
+            "total": nums[1][4],
+            "unit_rect": (nums[0][0] - 1, nums[0][1] - 1, nums[0][2] + 1, nums[0][3] + 1),
+            "total_rect": (nums[1][0] - 1, nums[1][1] - 1, nums[1][2] + 1, nums[1][3] + 1),
+        })
+
+    price_rows.sort(key=lambda x: x["y"])
+    # Deduplicate if the PDF extraction contains repeated tokens.
+    unique = []
+    seen_y = set()
+    for row in price_rows:
+        key = round(row["y"], 1)
+        if key not in seen_y:
+            seen_y.add(key)
+            unique.append(row)
+    data["items"] = unique
+
+    finance = text_in_rect((420, 490, 590, 570))
+    payment = text_in_rect((10, 565, 350, 595))
+    payment_row = text_in_rect((10, 600, 350, 630))
+
+    m = re.search(r"Frete\s*\+?\s*R\$\s*([\d.]+,\d{2})", finance, re.I)
     data["frete"] = m.group(1) if m else ""
-    m = re.search(r"Descontos\s*\n-\s*R\$\s*([\d.]+,\d{2})\s*\(([\d,]+)%\)", finance, re.I)
+    m = re.search(r"Descontos?\s*-\s*R\$\s*([\d.]+,\d{2})\s*\(([\d,]+)%\)", finance, re.I)
     data["desconto"] = m.group(1) if m else ""
     data["desconto_pct"] = m.group(2) if m else ""
-    m = re.search(r"Valor líquido\s*\nR\$\s*([\d.]+,\d{2})", finance, re.I)
-    data["liquido"] = m.group(1) if m else ""
 
-    m = re.search(r"Condição:\s*(.+)", payment)
+    m = re.search(r"Condição:\s*(.+)", payment, re.I)
     data["condicao"] = m.group(1).strip() if m else ""
     m = re.search(r"(\d{2}/\d{2}/\d{4})", payment_row)
     data["vencimento"] = m.group(1) if m else ""
@@ -126,97 +197,62 @@ def parse_pdf(pdf_bytes):
     doc.close()
     return data
 
-def fit_text(page, rect, text, fontname="helv", fontsize=9, color=(0,0,0), align=0, min_size=5.5):
-    """Insert text, reducing font size if needed."""
-    size = fontsize
-    while size >= min_size:
-        spare = page.insert_textbox(
-            rect, str(text or ""), fontname=fontname, fontsize=size,
-            color=color, align=align, lineheight=1.0
-        )
-        if spare >= -0.5:
-            return
-        # Remove the text just inserted by reverting page edits is not possible,
-        # so use a fresh redaction workflow in callers. This helper is intended
-        # only for single-pass calls with a conservative size.
-        return
 
-def cover(page, rect, color=(1,1,1)):
-    page.draw_rect(rect, color=color, fill=color, overlay=True)
-
-def put(page, rect, text, font="helv", size=9, align=0, min_size=5.5):
-    cover(page, rect)
-    size_now = size
-    while size_now >= min_size:
-        # Use a fresh rectangle each attempt; insert_textbox returns overflow.
-        page.insert_textbox(
-            rect, str(text or ""), fontname=font, fontsize=size_now,
-            color=(0,0,0), align=align, lineheight=1.0, overlay=True
-        )
-        # PyMuPDF doesn't expose whether this exact operation overflowed without
-        # leaving content, so we keep the predefined sizes for this fixed template.
-        return
+def redact_and_write(page, rect, text, font="helv", size=8.5, align=0):
+    r = fitz.Rect(rect)
+    page.add_redact_annot(r, fill=(1, 1, 1))
+    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+    page.insert_textbox(
+        r, str(text or ""), fontname=font, fontsize=size,
+        color=(0, 0, 0), align=align, lineheight=1.0, overlay=True
+    )
 
 def generate_pdf(pdf_bytes, d):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]
 
-    # Top line: date and orçamento number
-    put(page, fitz.Rect(14, 7, 150, 25), d["data"], "helv", 8.5)
-    put(page, fitz.Rect(465, 7, 580, 25), f"Orçamento {d['orcamento']}", "helv", 8.5, align=2)
+    # Header: replace only the editable fields, not the surrounding labels.
+    redact_and_write(page, (276, 110, 375, 129), d["consultor"], "hebo", 8.6)
 
-    # Client block
-    put(page, fitz.Rect(31, 166, 455, 181), d["cliente"], "hebo", 9.2)
-    put(page, fitz.Rect(480, 166, 574, 181), d["telefone_cliente"], "helv", 8.5, align=2)
-    put(page, fitz.Rect(31, 185, 330, 198), f"CNPJ: {d['cnpj']}", "hebo", 8.2)
-    put(page, fitz.Rect(31, 204, 560, 220), d["endereco_cliente"], "helv", 7.8)
+    # Product prices: use the exact numeric rectangles discovered in the original PDF.
+    # This works with 1, 2, 3, ... items instead of hard-coding two rows.
+    total = 0.0
+    for item in d["items"]:
+        unit = br_money_to_float(item["unit"])
+        qty = int(item.get("qty", 1) or 1)
+        item_total = unit * qty
+        total += item_total
 
-    # Validity / delivery block
-    put(page, fitz.Rect(35, 240, 180, 252), f"Validade: {d['validade']}", "hebo", 7.7)
-    put(page, fitz.Rect(35, 252, 210, 264), f"Previsão de entrega: {d['entrega']}", "hebo", 7.7)
-    put(page, fitz.Rect(35, 263, 438, 276), f"Endereço de entrega: {d['endereco_entrega']}", "helv", 7.5)
+        redact_and_write(page, item["unit_rect"], f"{unit:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), "helv", 8.0, align=2)
+        redact_and_write(page, item["total_rect"], f"{item_total:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), "helv", 8.0, align=2)
 
-    # Partner
-    put(page, fitz.Rect(70, 280, 315, 294), d["parceiro"], "helv", 7.8)
-
-    # Item prices and descriptions
-    put(page, fitz.Rect(175, 350, 445, 375), d["item1_desc"], "helv", 8.0)
-    put(page, fitz.Rect(505, 350, 576, 374), float_to_br_money(br_money_to_float(d["item1_unit"])), "helv", 8.0, align=2)
-
-    put(page, fitz.Rect(175, 441, 445, 458), d["item2_desc"], "helv", 8.0)
-    put(page, fitz.Rect(505, 441, 576, 458), float_to_br_money(br_money_to_float(d["item2_unit"])), "helv", 8.0, align=2)
-
-    # Financial values
-    item1 = br_money_to_float(d["item1_unit"])
-    item2 = br_money_to_float(d["item2_unit"])
-    total = item1 + item2
     frete = br_money_to_float(d["frete"])
     pct = br_money_to_float(d["desconto_pct"])
-    desconto = br_money_to_float(d["desconto"])
+    desconto_manual = br_money_to_float(d["desconto"])
+    desconto = total * pct / 100 if d["desconto_pct"].strip() else desconto_manual
     liquido = total + frete - desconto
 
-    # If the user changed the percentage but not the discount, calculate discount.
-    desconto = total * pct / 100 if pct else desconto
-    liquido = total + frete - desconto
+    # Summary values
+    redact_and_write(page, (542, 496, 579, 512), f"{total:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), "hebo", 8.0, align=2)
+    redact_and_write(page, (549, 514, 579, 530), f"{frete:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), "helv", 8.0, align=2)
+    desc_text = f"{desconto:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    redact_and_write(page, (515, 532, 552, 548), desc_text, "helv", 8.0, align=2)
+    if d["desconto_pct"].strip():
+        redact_and_write(page, (553, 532, 579, 548), f"({d['desconto_pct']}%)", "helv", 8.0, align=2)
+    redact_and_write(page, (542, 551, 579, 568), f"{liquido:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), "hebo", 8.5, align=2)
 
-    put(page, fitz.Rect(515, 496, 577, 510), float_to_br_money(total), "hebo", 8.0, align=2)
-    put(page, fitz.Rect(510, 514, 577, 529), "+ " + float_to_br_money(frete), "helv", 8.0, align=2)
-    put(page, fitz.Rect(495, 532, 577, 547), "- " + float_to_br_money(desconto) + (f" ({d['desconto_pct']}%)" if d["desconto_pct"] else ""), "helv", 8.0, align=2)
-    put(page, fitz.Rect(500, 551, 577, 566), float_to_br_money(liquido), "hebo", 8.5, align=2)
-
-    # Payment block
-    put(page, fitz.Rect(20, 567, 300, 579), f"Condição: {d['condicao']}", "hebo", 7.7)
-    put(page, fitz.Rect(20, 579, 220, 591), f"Pagamento: 1x {float_to_br_money(liquido)}", "hebo", 7.7)
-
-    put(page, fitz.Rect(20, 609, 80, 622), "1", "helv", 7.8)
-    put(page, fitz.Rect(70, 609, 145, 622), d["vencimento"], "helv", 7.8)
-    put(page, fitz.Rect(175, 609, 270, 622), float_to_br_money(liquido), "helv", 7.8)
-    put(page, fitz.Rect(270, 609, 340, 622), d["forma"], "helv", 7.8)
+    # Payment values
+    redact_and_write(page, (68, 567, 135, 581), d["condicao"], "hebo", 7.5)
+    redact_and_write(page, (100, 579, 155, 594), f"1x {liquido:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), "hebo", 7.5)
+    redact_and_write(page, (73, 606, 125, 624), d["vencimento"], "helv", 7.6)
+    redact_and_write(page, (183, 606, 239, 624), f"{liquido:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), "helv", 7.6, align=2)
+    redact_and_write(page, (241, 606, 275, 624), d["forma"], "helv", 7.6)
 
     out = io.BytesIO()
     doc.save(out, garbage=4, deflate=True)
     doc.close()
     return out.getvalue()
+
 
 # ----------------------------
 # UI
@@ -231,33 +267,54 @@ if uploaded:
         st.error(f"Não consegui ler este PDF: {e}")
         st.stop()
 
-    st.success("PDF carregado. Confira os campos abaixo antes de gerar o novo arquivo.")
+    if not parsed.get("items"):
+        st.error("Não encontrei os itens/valores deste modelo de orçamento. Envie o PDF original exportado pelo Pontta.")
+        st.stop()
+
+    st.success(f"PDF carregado: {len(parsed['items'])} item(ns) encontrado(s).")
 
     with st.form("editor"):
         st.subheader("Cabeçalho")
+
         c1, c2 = st.columns(2)
         with c1:
             data = st.text_input("Data", parsed.get("data", ""))
             orcamento = st.text_input("Nº do orçamento", parsed.get("orcamento", ""))
+            consultor = st.text_input("Consultor / vendedor", parsed.get("consultor", ""))
             cliente = st.text_input("Cliente", parsed.get("cliente", ""))
             cnpj = st.text_input("CNPJ", parsed.get("cnpj", ""))
-            telefone_cliente = st.text_input("Telefone do cliente", parsed.get("telefone_cliente", ""))
         with c2:
+            telefone_cliente = st.text_input("Telefone do cliente", parsed.get("telefone_cliente", ""))
             endereco_cliente = st.text_input("Endereço do cliente", parsed.get("endereco_cliente", ""))
             validade = st.text_input("Validade", parsed.get("validade", ""))
             entrega = st.text_input("Previsão de entrega", parsed.get("entrega", ""))
             endereco_entrega = st.text_input("Endereço de entrega", parsed.get("endereco_entrega", ""))
-            parceiro = st.text_input("Parceiro / contato", parsed.get("parceiro", ""))
 
-        st.subheader("Valores")
+        st.subheader("Valores dos itens")
+        st.caption("O sistema encontrou automaticamente todos os itens. Altere o valor unitário; o total do item e o total do orçamento serão recalculados.")
+
+        edited_items = []
+        for i, item in enumerate(parsed["items"], start=1):
+            label = item["description"] or f"Item {i}"
+            label = label[:90] + ("..." if len(label) > 90 else "")
+            cols = st.columns([0.75, 0.25])
+            with cols[0]:
+                st.markdown(f"**Item {i} — {label}**")
+                st.caption(f"Quantidade: {item['qty']} UN")
+            with cols[1]:
+                unit = st.text_input("Valor unitário", item["unit"], key=f"unit_{i}")
+            edited_items.append({
+                **item,
+                "unit": unit,
+            })
+
+        st.subheader("Financeiro")
         c1, c2 = st.columns(2)
         with c1:
-            item1_unit = st.text_input("Valor do item 1", parsed.get("item1_unit", ""))
-            item2_unit = st.text_input("Valor do item 2", parsed.get("item2_unit", ""))
             frete = st.text_input("Frete", parsed.get("frete", ""))
-        with c2:
             desconto_pct = st.text_input("Desconto (%)", parsed.get("desconto_pct", ""))
             desconto = st.text_input("Desconto (R$) — usado se % estiver vazio", parsed.get("desconto", ""))
+        with c2:
             condicao = st.text_input("Condição de pagamento", parsed.get("condicao", ""))
             vencimento = st.text_input("Vencimento", parsed.get("vencimento", ""))
             forma = st.text_input("Forma de pagamento", parsed.get("forma", ""))
@@ -266,14 +323,13 @@ if uploaded:
 
     if submitted:
         d = {
-            "data": data, "orcamento": orcamento, "cliente": cliente, "cnpj": cnpj,
-            "telefone_cliente": telefone_cliente, "endereco_cliente": endereco_cliente,
-            "validade": validade, "entrega": entrega, "endereco_entrega": endereco_entrega,
-            "parceiro": parceiro, "item1_desc": parsed.get("item1_desc", ""),
-            "item2_desc": parsed.get("item2_desc", ""), "item1_unit": item1_unit,
-            "item2_unit": item2_unit, "frete": frete, "desconto_pct": desconto_pct,
-            "desconto": desconto, "condicao": condicao, "vencimento": vencimento,
-            "forma": forma,
+            "data": data, "orcamento": orcamento, "consultor": consultor,
+            "cliente": cliente, "cnpj": cnpj, "telefone_cliente": telefone_cliente,
+            "endereco_cliente": endereco_cliente, "validade": validade,
+            "entrega": entrega, "endereco_entrega": endereco_entrega,
+            "items": edited_items, "frete": frete,
+            "desconto_pct": desconto_pct, "desconto": desconto,
+            "condicao": condicao, "vencimento": vencimento, "forma": forma,
         }
         try:
             result = generate_pdf(pdf_bytes, d)
@@ -300,3 +356,4 @@ if uploaded:
         )
 else:
     st.info("Comece enviando um orçamento PDF exportado do Pontta.")
+
