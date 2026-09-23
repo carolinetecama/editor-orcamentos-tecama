@@ -429,7 +429,7 @@ def generate_pdf(pdf_bytes, d):
     replace_word(fp, f["liquido_rect"], money(liquido), "hebo", 8.3, align=2)
 
     condition = d["condition"]
-    percents = [float(x.replace(",", ".")) for x in re.findall(r"(\d+(?:,\d+)?)\s*%", condition)]
+    percents = [float(x.replace(",", ".")) for x in re.findall(r"(\d+(?:,\d+)?)\s*(?:%|a\s+\d+\s+DDF)", condition, flags=re.I)]
     rows = f.get("payment_rows", [])
     if percents and rows:
         n=min(len(percents),len(rows))
