@@ -406,12 +406,15 @@ def parse_payment_percentages(condition):
 
 def generate_pdf(pdf_bytes, d):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    # 1) Cabeçalho
     p0 = doc[0]
     h = d["header"]
     replace_word(p0, h["name_rect"], d["consultor"], "hebo", 8.5)
     replace_word(p0, h["phone_rect"], d["phone"], "helv", 8.0, align=2)
     replace_word(p0, h["email_rect"], d["email"], "helv", 7.7, align=2)
 
+    # 2) Itens
     total = 0.0
     for item in d["items"]:
         page = doc[item["page"]]
@@ -422,6 +425,7 @@ def generate_pdf(pdf_bytes, d):
         replace_word(page, item["unit_rect"], money(unit), "helv", 7.8, align=2)
         replace_word(page, item["total_rect"], money(item_total), "helv", 7.8, align=2)
 
+    # 3) Financeiro
     f = d["finance"]
     frete = round(money_float(d["frete"]), 2)
     if str(d["desconto_pct"]).strip():
@@ -431,8 +435,8 @@ def generate_pdf(pdf_bytes, d):
         pct = None
         desconto = round(money_float(d["desconto"]), 2)
     liquido = round(total + frete - desconto, 2)
-    fp = doc[f["page"]]
 
+    fp = doc[f["page"]]
     replace_word(fp, f["total_rect"], money(total), "hebo", 8.0, align=2)
     replace_word(fp, f["frete_rect"], money(frete), "helv", 8.0, align=2)
     replace_word(fp, f["desconto_rect"], money(desconto), "helv", 8.0, align=2)
@@ -441,31 +445,60 @@ def generate_pdf(pdf_bytes, d):
         replace_word(fp, f["desconto_pct_rect"], pct_text, "helv", 8.0, align=2)
     replace_word(fp, f["liquido_rect"], money(liquido), "hebo", 8.3, align=2)
 
+    # 4) Pagamento — NÃO editar pedaços individuais da linha.
+    # O PDF do Pontta coloca a linha 'Condição' imediatamente acima de
+    # 'Pagamento', com caixas de texto que se sobrepõem verticalmente.
+    # Redigir apenas o bloco inteiro e redesenhar as duas linhas evita
+    # apagar a parte inferior da linha 'Condição'.
     condition = d["condition"]
-    percents = [float(x.replace(",", ".")) for x in re.findall(r"(\d+(?:,\d+)?)\s*(?:%|a\s+\d+\s+DDF)", condition, flags=re.I)]
+    percents = parse_payment_percentages(condition)
     rows = f.get("payment_rows", [])
+
     if percents and rows:
-        n=min(len(percents),len(rows))
-        amounts=[]; remaining=liquido
+        n = min(len(percents), len(rows))
+        amounts = []
+        remaining = liquido
         for i in range(n):
-            if i==n-1: amount=round(remaining,2)
+            if i == n - 1:
+                amount = round(remaining, 2)
             else:
-                amount=round(liquido*percents[i]/100,2)
-                remaining=round(remaining-amount,2)
+                amount = round(liquido * percents[i] / 100, 2)
+                remaining = round(remaining - amount, 2)
             amounts.append(amount)
 
-        # Replace ONLY the three numeric amounts in the existing Pagamento line.
-        # Keep "Pagamento:", "Entrada", "1x", plus signs, etc. exactly as Pontta printed them.
-        summary_rects = f.get("summary_amounts", [])
-        for rect_info, amount in zip(summary_rects[:n], amounts):
-            replace_word(fp, rect_info["rect"], money(amount), "hebo", 7.5, align=0)
+        # Atualiza a tabela inferior primeiro, nas posições originais.
+        for row, amount in zip(rows[:n], amounts):
+            replace_word(fp, row["rect"], money(amount), "helv", 7.6, align=2)
 
-        # Replace all table amounts from the original coordinates.
-        for row,amount in zip(rows[:n],amounts):
-            replace_word(fp,row["rect"],money(amount),"helv",7.6,align=2)
+        # Redesenha somente o bloco das duas linhas de condição/pagamento.
+        # Coordenadas são relativas ao template Pontta e deixam a tabela abaixo intacta.
+        block = fitz.Rect(20.5, 333.8, 555.0, 359.3)
+        fp.add_redact_annot(block, fill=(1, 1, 1))
+        fp.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
-    out=io.BytesIO()
-    doc.save(out,garbage=4,deflate=True)
+        # Mantém a condição original exatamente como o usuário recebeu.
+        fp.insert_text(
+            (21.68, 344.78),
+            f"Condição: {condition}",
+            fontname="hebo", fontsize=9.0,
+            color=(0,0,0), overlay=True
+        )
+
+        # Mantém a estrutura textual do Pontta e troca somente os valores.
+        pieces = [f"Entrada R$ {money(amounts[0])}"]
+        for i, amount in enumerate(amounts[1:], 1):
+            pieces.append(f"1x R$ {money(amount)}")
+        payment_text = "Pagamento: " + " + ".join(pieces)
+
+        fp.insert_text(
+            (21.68, 355.50),
+            payment_text,
+            fontname="hebo", fontsize=9.0,
+            color=(0,0,0), overlay=True
+        )
+
+    out = io.BytesIO()
+    doc.save(out, garbage=4, deflate=True)
     doc.close()
     return out.getvalue()
 
