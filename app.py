@@ -165,49 +165,61 @@ def detect_header(page):
     }
 
 def detect_items(doc):
+    """
+    Detect each item from the visual row structure of the Pontta PDF.
+    We look for two R$ tokens on the same Y line: unit price and total.
+    This is more reliable than relying on PDF text blocks, which can split
+    an item into several independent blocks.
+    """
     items = []
     for page_index, page in enumerate(doc):
-        blocks = page.get_text("blocks")
-        words = words_on_page(page)
+        words = page.get_text("words")
 
-        for b in blocks:
-            x0,y0,x1,y1,txt = b[:5]
-            if not re.search(r"\b\d+\s+UN\b", txt):
-                continue
-            if "R$" not in txt:
+        # Candidate price numbers in the two price columns.
+        price_numbers = [
+            w for w in words
+            if is_money_number(w[4]) and 440 <= w[0] <= 580
+        ]
+
+        # Group price numbers by line/Y.
+        rows = {}
+        for w in price_numbers:
+            key = round(w[1], 1)
+            rows.setdefault(key, []).append(w)
+
+        for y, row in sorted(rows.items()):
+            row = sorted(row, key=lambda w: w[0])
+            # Need a unit price around x=444 and a total around x=542.
+            unit_candidates = [w for w in row if 440 <= w[0] <= 490]
+            total_candidates = [w for w in row if 535 <= w[0] <= 580]
+            if not unit_candidates or not total_candidates:
                 continue
 
-            # Extract quantity from block.
-            qm = re.search(r"(\d+)\s+UN", txt)
-            if not qm:
-                continue
-            qty = int(qm.group(1))
+            unit_w = unit_candidates[0]
+            total_w = total_candidates[0]
 
-            # Identify money numbers on this item row by y.
-            row_words = [w for w in words if abs(w[1]-y0) <= 3 and w[0] >= x0-2 and w[0] <= x1+2]
-            money_words = [w for w in row_words if is_money_number(w[4])]
-            # Original PDFs have two numeric price words: unit and total.
-            if len(money_words) < 2:
-                # Some PDFs split "R$" and numeric values but still keep numbers in block.
-                money_words = [w for w in words if is_money_number(w[4]) and abs(w[1]-y0) <= 5 and w[0] > 400]
-            if len(money_words) < 2:
+            # Quantity and item name are on the same line.
+            same_line = [w for w in words if abs(w[1] - y) <= 1.5]
+            qty_words = [
+                w for w in same_line
+                if 20 <= w[0] < 70 and re.fullmatch(r"\d+", w[4])
+            ]
+            if not qty_words:
                 continue
-            money_words = sorted(money_words, key=lambda w:w[0])
-            unit_w, total_w = money_words[-2], money_words[-1]
+            qty = int(qty_words[0][4])
 
-            # Description: first line of block after quantity and before R$.
-            lines = [re.sub(r"\s+", " ", ln).strip() for ln in txt.splitlines() if ln.strip()]
-            desc = ""
-            for ln in lines:
-                if " UN " in f" {ln} ":
-                    desc = re.sub(r"^\d+\s+UN\s*", "", ln, flags=re.I).strip()
-                    break
-            if not desc:
+            # Item description lives between x~145 and before the unit price.
+            desc_words = [
+                w for w in same_line
+                if 140 <= w[0] < 410
+            ]
+            if not desc_words:
                 continue
+            desc = " ".join(w[4] for w in sorted(desc_words, key=lambda w:w[0])).strip()
 
             items.append({
                 "page": page_index,
-                "y": y0,
+                "y": y,
                 "qty": qty,
                 "description": desc,
                 "unit": parse_number(unit_w[4]),
@@ -218,79 +230,82 @@ def detect_items(doc):
 
     return items
 
+
 def detect_finance(doc):
-    # Finance is normally on the last page. Find the exact numeric words
-    # associated with the labels instead of hard-coded coordinates.
-    page_index = len(doc)-1
+    page_index = len(doc) - 1
     page = doc[page_index]
-    words = words_on_page(page)
+    words = page.get_text("words")
 
-    def label_and_value(label, y_hint=None):
-        labels = [w for w in words if w[4].lower().startswith(label.lower())]
-        if y_hint is not None:
-            labels = sorted(labels, key=lambda w: abs(w[1]-y_hint))
+    def value_after_rs_near_label(label):
+        labels = [w for w in words if w[4].lower() == label.lower()]
         if not labels:
-            return None, None
+            return None
         lab = labels[0]
-        candidates = [w for w in words if is_money_number(w[4]) and abs(w[1]-lab[1]) <= 3 and w[0] > lab[2]]
-        candidates.sort(key=lambda w:w[0])
-        return lab, (candidates[0] if candidates else None)
+        # Find R$ to the right on the same line and the number immediately after it.
+        rs = [w for w in words if w[4] == "R$" and abs(w[1]-lab[1]) <= 3 and w[0] > lab[2]]
+        rs.sort(key=lambda w:w[0])
+        if not rs:
+            return None
+        r = rs[0]
+        nums = [w for w in words if is_money_number(w[4]) and abs(w[1]-r[1]) <= 3 and w[0] > r[2]]
+        nums.sort(key=lambda w:w[0])
+        return nums[0] if nums else None
 
-    total_label, total_w = label_and_value("Total")
-    frete_label, frete_w = label_and_value("Frete")
-    desc_label, desc_w = label_and_value("Descontos")
-    liquid_label, liquid_w = label_and_value("Valor")
+    total_w = value_after_rs_near_label("Total")
+    frete_w = value_after_rs_near_label("Frete")
+    desc_w = value_after_rs_near_label("Descontos")
+    liquid_w = value_after_rs_near_label("líquido")
 
-    # "Valor" may return another value; locate the exact label.
-    vlabs = [w for w in words if w[4].lower() == "líquido"]
-    if vlabs:
-        vl = vlabs[0]
-        candidates = [w for w in words if is_money_number(w[4]) and abs(w[1]-vl[1]) <= 3 and w[0] > vl[2]]
-        candidates.sort(key=lambda w:w[0])
-        liquid_w = candidates[0] if candidates else liquid_w
-
-    # Discount percentage is a separate numeric token in parentheses.
     pct = ""
-    if desc_label:
-        near = [w for w in words if abs(w[1]-desc_label[1]) <= 4 and re.fullmatch(r"\(\d+,\d+%\)|\(\d+%\)", w[4])]
-        if near:
-            pct = re.sub(r"[()%]", "", near[0][4])
+    desc_labels = [w for w in words if w[4].lower().startswith("descont")]
+    if desc_labels:
+        dl = desc_labels[0]
+        pct_words = [w for w in words if abs(w[1]-dl[1]) <= 3 and re.fullmatch(r"\(\d+(?:,\d+)?%\)", w[4])]
+        if pct_words:
+            pct = re.sub(r"[()%]", "", pct_words[0][4])
 
-    # Condition / payment text blocks
     blocks = page.get_text("blocks")
     condition = ""
     payment = ""
     condition_rect = None
     payment_rect = None
-    for b in blocks:
-        txt = b[4].strip()
+    for bl in blocks:
+        txt = bl[4].strip()
         if txt.startswith("Condição:"):
-            condition = re.sub(r"^Condição:\s*", "", txt.splitlines()[0]).strip()
-            condition_rect = fitz.Rect(b[0], b[1], b[2], b[3])
-        if txt.startswith("Pagamento:"):
-            payment = re.sub(r"^Pagamento:\s*", "", txt.splitlines()[0]).strip()
-            payment_rect = fitz.Rect(b[0], b[1], b[2], b[3])
+            condition = txt.splitlines()[0].replace("Condição:", "", 1).strip()
+            condition_rect = fitz.Rect(bl[0], bl[1], bl[2], bl[3])
+        elif txt.startswith("Pagamento:"):
+            payment = txt.splitlines()[0].replace("Pagamento:", "", 1).strip()
+            payment_rect = fitz.Rect(bl[0], bl[1], bl[2], bl[3])
 
-    # Payment table rows. Keep labels/dates/form untouched, replace only amounts.
+    # Payment table: each row has a date, R$, amount, and Boleto.
     payment_rows = []
-    for b in blocks:
-        txt = b[4].strip()
-        if not txt or "Boleto" not in txt:
+    for w in words:
+        if not re.fullmatch(r"\d{2}/\d{2}/\d{4}", w[4]):
             continue
-        lines = txt.splitlines()
-        for line in lines:
-            if "Boleto" in line:
-                nums = [w for w in words if is_money_number(w[4]) and b[1]-1 <= w[1] <= b[3]+1]
-                dates = [w for w in words if re.fullmatch(r"\d{2}/\d{2}/\d{4}", w[4]) and b[1]-1 <= w[1] <= b[3]+1]
-                if nums:
-                    # Last numeric token in this block is the payment amount.
-                    aw = sorted(nums, key=lambda w:w[0])[-1]
-                    payment_rows.append({
-                        "page": page_index,
-                        "amount": parse_number(aw[4]),
-                        "rect": rect_from_word(aw, 1),
-                        "label": line.split()[0] if line.split() else "",
-                    })
+        y = w[1]
+        rs = [x for x in words if x[4] == "R$" and abs(x[1]-y) <= 3 and x[0] > w[2]]
+        rs.sort(key=lambda x:x[0])
+        if not rs:
+            continue
+        r = rs[0]
+        nums = [x for x in words if is_money_number(x[4]) and abs(x[1]-y) <= 3 and x[0] > r[2]]
+        nums.sort(key=lambda x:x[0])
+        if nums:
+            payment_rows.append({
+                "page": page_index,
+                "amount": parse_number(nums[0][4]),
+                "rect": rect_from_word(nums[0], 1),
+                "date": w[4],
+            })
+
+    # Remove accidental duplicates by Y.
+    seen=set()
+    clean_rows=[]
+    for r in payment_rows:
+        key=round(r["rect"].y0,1)
+        if key not in seen:
+            seen.add(key); clean_rows.append(r)
 
     return {
         "page": page_index,
@@ -303,11 +318,12 @@ def detect_finance(doc):
         "payment": payment,
         "condition_rect": condition_rect,
         "payment_rect": payment_rect,
-        "payment_rows": payment_rows,
+        "payment_rows": clean_rows,
         "frete": parse_number(frete_w[4]) if frete_w else 0,
         "desconto": parse_number(desc_w[4]) if desc_w else 0,
         "liquido": parse_number(liquid_w[4]) if liquid_w else 0,
     }
+
 
 def parse_pdf(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
