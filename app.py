@@ -241,14 +241,13 @@ def detect_finance(doc):
         if not labels:
             return None
         lab = labels[0]
-        # Find R$ to the right on the same line and the number immediately after it.
         rs = [w for w in words if w[4] == "R$" and abs(w[1]-lab[1]) <= 3 and w[0] > lab[2]]
-        rs.sort(key=lambda w:w[0])
+        rs.sort(key=lambda x: x[0])
         if not rs:
             return None
         r = rs[0]
         nums = [w for w in words if is_money_number(w[4]) and abs(w[1]-r[1]) <= 3 and w[0] > r[2]]
-        nums.sort(key=lambda w:w[0])
+        nums.sort(key=lambda x: x[0])
         return nums[0] if nums else None
 
     total_w = value_after_rs_near_label("Total")
@@ -256,19 +255,24 @@ def detect_finance(doc):
     desc_w = value_after_rs_near_label("Descontos")
     liquid_w = value_after_rs_near_label("líquido")
 
-    pct = ""
+    # Exact discount percentage token.
+    pct_w = None
     desc_labels = [w for w in words if w[4].lower().startswith("descont")]
     if desc_labels:
         dl = desc_labels[0]
-        pct_words = [w for w in words if abs(w[1]-dl[1]) <= 3 and re.fullmatch(r"\(\d+(?:,\d+)?%\)", w[4])]
-        if pct_words:
-            pct = re.sub(r"[()%]", "", pct_words[0][4])
+        pct_candidates = [
+            w for w in words
+            if abs(w[1]-dl[1]) <= 4 and re.fullmatch(r"\(\d+(?:,\d+)?%\)", w[4])
+        ]
+        if pct_candidates:
+            pct_w = sorted(pct_candidates, key=lambda w:w[0])[0]
 
     blocks = page.get_text("blocks")
     condition = ""
     payment = ""
     condition_rect = None
     payment_rect = None
+
     for bl in blocks:
         txt = bl[4].strip()
         if txt.startswith("Condição:"):
@@ -278,42 +282,53 @@ def detect_finance(doc):
             payment = txt.splitlines()[0].replace("Pagamento:", "", 1).strip()
             payment_rect = fitz.Rect(bl[0], bl[1], bl[2], bl[3])
 
-    # Payment table: each row has a date, R$, amount, and Boleto.
+    # The table has exactly one amount after each R$ on the same row.
+    # Detect by the payment dates, which are stable even when values change.
     payment_rows = []
-    for w in words:
-        if not re.fullmatch(r"\d{2}/\d{2}/\d{4}", w[4]):
+    for date_w in words:
+        if not re.fullmatch(r"\d{2}/\d{2}/\d{4}", date_w[4]):
             continue
-        y = w[1]
-        rs = [x for x in words if x[4] == "R$" and abs(x[1]-y) <= 3 and x[0] > w[2]]
-        rs.sort(key=lambda x:x[0])
-        if not rs:
+        y = date_w[1]
+        rs_candidates = [
+            w for w in words
+            if w[4] == "R$" and abs(w[1]-y) <= 1.5 and w[0] > 175 and w[0] < 210
+        ]
+        if not rs_candidates:
             continue
-        r = rs[0]
-        nums = [x for x in words if is_money_number(x[4]) and abs(x[1]-y) <= 3 and x[0] > r[2]]
-        nums.sort(key=lambda x:x[0])
-        if nums:
-            payment_rows.append({
-                "page": page_index,
-                "amount": parse_number(nums[0][4]),
-                "rect": rect_from_word(nums[0], 1),
-                "date": w[4],
-            })
+        rs_w = min(rs_candidates, key=lambda w:w[0])
+        amount_candidates = [
+            w for w in words
+            if is_money_number(w[4]) and abs(w[1]-y) <= 1.5 and w[0] > rs_w[2] and w[0] < 245
+        ]
+        if not amount_candidates:
+            continue
+        amount_w = min(amount_candidates, key=lambda w:w[0])
+        payment_rows.append({
+            "page": page_index,
+            "amount": parse_number(amount_w[4]),
+            "rect": rect_from_word(amount_w, 1),
+            "date": date_w[4],
+            "y": y,
+        })
 
-    # Remove accidental duplicates by Y.
-    seen=set()
-    clean_rows=[]
+    payment_rows.sort(key=lambda r:r["y"])
+    # De-duplicate by row Y.
+    clean_rows = []
+    seen = set()
     for r in payment_rows:
-        key=round(r["rect"].y0,1)
-        if key not in seen:
-            seen.add(key); clean_rows.append(r)
+        k = round(r["y"], 1)
+        if k not in seen:
+            seen.add(k)
+            clean_rows.append(r)
 
     return {
         "page": page_index,
         "total_rect": rect_from_word(total_w, 1) if total_w else None,
         "frete_rect": rect_from_word(frete_w, 1) if frete_w else None,
         "desconto_rect": rect_from_word(desc_w, 1) if desc_w else None,
+        "desconto_pct_rect": rect_from_word(pct_w, 1) if pct_w else None,
         "liquido_rect": rect_from_word(liquid_w, 1) if liquid_w else None,
-        "desconto_pct": pct,
+        "desconto_pct": re.sub(r"[()%]", "", pct_w[4]) if pct_w else "",
         "condition": condition,
         "payment": payment,
         "condition_rect": condition_rect,
@@ -323,7 +338,6 @@ def detect_finance(doc):
         "desconto": parse_number(desc_w[4]) if desc_w else 0,
         "liquido": parse_number(liquid_w[4]) if liquid_w else 0,
     }
-
 
 def parse_pdf(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -366,73 +380,73 @@ def update_payment_text(page, rect, new_text):
 
 def generate_pdf(pdf_bytes, d):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-
-    # Header: only the actual values are replaced.
     p0 = doc[0]
     h = d["header"]
     replace_word(p0, h["name_rect"], d["consultor"], "hebo", 8.5)
     replace_word(p0, h["phone_rect"], d["phone"], "helv", 8.0, align=2)
     replace_word(p0, h["email_rect"], d["email"], "helv", 7.7, align=2)
 
-    # Items across all pages.
     total = 0.0
     for item in d["items"]:
         page = doc[item["page"]]
         qty = int(item["qty"])
-        unit = money_float(item["unit"])
-        item_total = qty * unit
-        total += item_total
-
+        unit = round(money_float(item["unit"]), 2)
+        item_total = round(qty * unit, 2)
+        total = round(total + item_total, 2)
         replace_word(page, item["unit_rect"], money(unit), "helv", 7.8, align=2)
         replace_word(page, item["total_rect"], money(item_total), "helv", 7.8, align=2)
 
     f = d["finance"]
-    frete = money_float(d["frete"])
-    pct = money_float(d["desconto_pct"])
-    desconto = total * pct / 100 if d["desconto_pct"].strip() else money_float(d["desconto"])
-    liquido = total + frete - desconto
-
+    frete = round(money_float(d["frete"]), 2)
+    if str(d["desconto_pct"]).strip():
+        pct = float(str(d["desconto_pct"]).replace(",", "."))
+        desconto = round(total * pct / 100, 2)
+    else:
+        pct = None
+        desconto = round(money_float(d["desconto"]), 2)
+    liquido = round(total + frete - desconto, 2)
     fp = doc[f["page"]]
+
     replace_word(fp, f["total_rect"], money(total), "hebo", 8.0, align=2)
     replace_word(fp, f["frete_rect"], money(frete), "helv", 8.0, align=2)
     replace_word(fp, f["desconto_rect"], money(desconto), "helv", 8.0, align=2)
+    if f.get("desconto_pct_rect") and pct is not None:
+        pct_text = f"({int(pct) if float(pct).is_integer() else str(pct).replace('.', ',')}%)"
+        replace_word(fp, f["desconto_pct_rect"], pct_text, "helv", 8.0, align=2)
     replace_word(fp, f["liquido_rect"], money(liquido), "hebo", 8.3, align=2)
 
-    # Payment schedule: recalculate based on the original condition.
-    # If the condition has percentages (e.g. 34% + 33% + 33%), use them.
     condition = d["condition"]
     percents = [float(x.replace(",", ".")) for x in re.findall(r"(\d+(?:,\d+)?)\s*%", condition)]
-    if percents and f["payment_rows"]:
-        vals = []
-        remaining = liquido
-        for i, pct_i in enumerate(percents):
-            if i == len(percents)-1:
-                amount = remaining
+    rows = f.get("payment_rows", [])
+    if percents and rows:
+        n=min(len(percents),len(rows))
+        amounts=[]; remaining=liquido
+        for i in range(n):
+            if i==n-1: amount=round(remaining,2)
             else:
-                amount = round(liquido * pct_i / 100, 2)
-                remaining -= amount
-            vals.append(amount)
+                amount=round(liquido*percents[i]/100,2)
+                remaining=round(remaining-amount,2)
+            amounts.append(amount)
 
-        # Replace the payment line with the new values while preserving wording.
-        # The original condition is left untouched.
-        if f["payment_rect"] and vals:
-            # Generate a concise line following the Pontta style.
-            labels = ["Entrada"] + [f"{i}x" for i in range(1, len(vals))]
-            parts = []
-            for i, amount in enumerate(vals):
-                if i == 0:
-                    parts.append(f"Entrada R$ {money(amount)}")
-                else:
-                    parts.append(f"{i}x R$ {money(amount)}")
-            new_payment = "Pagamento: " + " + ".join(parts)
-            update_payment_text(fp, f["payment_rect"], new_payment)
+        # Replace the entire Pagamento summary line, including ALL old values.
+        if f.get("payment_rect"):
+            old=fitz.Rect(f["payment_rect"])
+            rect=fitz.Rect(old.x0-1,old.y0-1,560,old.y1+1)
+            fp.add_redact_annot(rect,fill=(1,1,1))
+            fp.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+            parts=[]
+            for i,amount in enumerate(amounts):
+                parts.append(("Entrada" if i==0 else f"{i}x")+f" R$ {money(amount)}")
+            fp.insert_textbox(rect,"Pagamento: "+" + ".join(parts),
+                              fontname="hebo",fontsize=7.5,color=(0,0,0),
+                              align=0,lineheight=1.0,overlay=True)
 
-        # Payment table values.
-        for row, amount in zip(f["payment_rows"], vals):
-            replace_word(fp, row["rect"], money(amount), "helv", 7.6, align=2)
+        # Replace all table amounts from the original coordinates.
+        for row,amount in zip(rows[:n],amounts):
+            replace_word(fp,row["rect"],money(amount),"helv",7.6,align=2)
 
-    out = io.BytesIO()
-    doc.save(out, garbage=4, deflate=True)
+    out=io.BytesIO()
+    doc.save(out,garbage=4,deflate=True)
     doc.close()
     return out.getvalue()
 
@@ -489,6 +503,21 @@ if uploaded:
 
         st.subheader("Pagamento")
         condition = st.text_input("Condição de pagamento", parsed["finance"]["condition"])
+
+        # Live calculation preview
+        preview_total = sum(int(it["qty"]) * money_float(it["unit"]) for it in edited_items)
+        preview_frete = money_float(frete)
+        preview_pct = money_float(desconto_pct)
+        preview_desconto = round(preview_total * preview_pct / 100, 2) if desconto_pct.strip() else money_float(desconto)
+        preview_liquido = round(preview_total + preview_frete - preview_desconto, 2)
+
+        st.markdown("### Conferência antes de gerar")
+        pc1, pc2, pc3, pc4 = st.columns(4)
+        pc1.metric("Total", f"R$ {money(preview_total)}")
+        pc2.metric("Frete", f"R$ {money(preview_frete)}")
+        pc3.metric("Desconto", f"R$ {money(preview_desconto)}")
+        pc4.metric("Valor líquido", f"R$ {money(preview_liquido)}")
+
 
         submitted = st.form_submit_button("📄 GERAR PDF EDITADO", type="primary", use_container_width=True)
 
