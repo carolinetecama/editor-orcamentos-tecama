@@ -1,467 +1,464 @@
 import io
 import re
+import hashlib
 import base64
-import fitz
+
+try:
+    import pymupdf as fitz
+except ImportError:  # versões antigas do PyMuPDF
+    import fitz
+
 import streamlit as st
 
 st.set_page_config(page_title="Editor de Orçamentos TECAMA", page_icon="📄", layout="wide")
 
+
 # ============================================================
-# Formatação
+# Formatação de valores
 # ============================================================
 def money_float(value):
+    """Converte '1.234,56', '1234,56', '1234.56' ou 'R$ 900' em float."""
     if value is None:
         return 0.0
     s = str(value).strip().replace("R$", "").replace(" ", "")
-    s = s.replace(".", "").replace(",", ".")
+    if not s:
+        return 0.0
+    if "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif re.fullmatch(r"\d+\.\d{1,2}", s):
+        pass  # 1234.56 -> ponto como decimal
+    else:
+        s = s.replace(".", "")  # 1.234 -> 1234
     try:
         return float(s)
-    except Exception:
+    except ValueError:
         return 0.0
+
 
 def money(v):
     s = f"{float(v):,.2f}"
     return s.replace(",", "X").replace(".", ",").replace("X", ".")
 
-def money_with_prefix(v):
-    return "R$ " + money(v)
+
+def pct_text(p):
+    p = round(float(p), 2)
+    return str(int(p)) if p.is_integer() else f"{p:g}".replace(".", ",")
+
 
 def parse_number(text):
     m = re.search(r"[\d.]+,\d{2}", str(text))
     return money_float(m.group(0)) if m else 0.0
 
+
 def is_money_number(s):
     return bool(re.fullmatch(r"[\d.]+,\d{2}", s.strip()))
 
+
 # ============================================================
-# Localização de textos no PDF
+# Células editáveis (posição + estilo original)
 # ============================================================
-def words_on_page(page):
-    return page.get_text("words")
+def all_spans(page):
+    spans = []
+    for b in page.get_text("dict")["blocks"]:
+        for line in b.get("lines", []):
+            for s in line["spans"]:
+                if s["text"].strip():
+                    spans.append(s)
+    return spans
 
-def rect_from_word(w, pad=0.5):
-    return fitz.Rect(w[0]-pad, w[1]-pad, w[2]+pad, w[3]+pad)
 
-def find_words(words, text):
-    return [w for w in words if w[4].strip().upper() == text.upper()]
+def span_for_word(spans, w):
+    pt = fitz.Point((w[0] + w[2]) / 2, (w[1] + w[3]) / 2)
+    for s in spans:
+        if fitz.Rect(s["bbox"]).contains(pt):
+            return s
+    return None
 
-def find_money_after(words, anchor_word, min_x=None, max_y=4):
-    ax1 = anchor_word[2]
-    ay = anchor_word[1]
-    candidates = []
-    for w in words:
-        if not is_money_number(w[4]):
-            continue
-        if w[0] < ax1 - 1:
-            continue
-        if abs(w[1] - ay) > max_y:
-            continue
-        if min_x is not None and w[0] < min_x:
-            continue
-        candidates.append(w)
-    candidates.sort(key=lambda w: w[0])
-    return candidates[0] if candidates else None
 
-def detect_header(page):
-    words = words_on_page(page)
+def _color(c):
+    return (((c >> 16) & 255) / 255, ((c >> 8) & 255) / 255, (c & 255) / 255)
 
-    def text_between(y0, y1):
-        arr = [w for w in words if y0 <= w[1] <= y1]
-        arr.sort(key=lambda w: (w[1], w[0]))
-        return " ".join(w[4] for w in arr)
 
-    header_text = text_between(100, 132)
-
-    # Consultor: name appears after "VENDAS:".
-    consultant_words = []
-    after_vendas = False
-    for w in sorted([x for x in words if 100 <= x[1] <= 132], key=lambda w:(w[1],w[0])):
-        t = w[4]
-        if t.upper().startswith("VENDAS"):
-            after_vendas = True
-            continue
-        if after_vendas and t not in ["(11)", "93061-2286"] and "@" not in t:
-            consultant_words.append(w)
-
-    # More robustly use the word "CONSULTOR" block and detect line positions.
-    name = ""
-    phone = ""
-    email = ""
-    for w in words:
-        t = w[4]
-        if t == "CAROLINE" or t == "WILSON":
-            pass
-
-    # Phone/email are easy to detect by pattern.
-    phone_words = [w for w in words if re.fullmatch(r"\(\d{2}\)", w[4]) or re.fullmatch(r"\d{4,5}-\d{4}", w[4])]
-    # Keep only header-area phone.
-    phone_words = [w for w in phone_words if 100 <= w[1] <= 132]
-    if phone_words:
-        # In this PDF phone may be a single block split into 2 words.
-        phone = " ".join(w[4] for w in sorted(phone_words, key=lambda w:w[0]))
-
-    email_words = [w for w in words if "@" in w[4] and 100 <= w[1] <= 132]
-    email = email_words[0][4] if email_words else ""
-
-    # Find the text block that starts with CONSULTOR DE VENDAS.
-    blocks = page.get_text("blocks")
-    consultant_block = None
-    for b in blocks:
-        txt = b[4]
-        if "CONSULTOR DE VENDAS:" in txt.upper():
-            consultant_block = b
-            break
-
-    if consultant_block:
-        x0,y0,x1,y1 = consultant_block[:4]
-        cw = [w for w in words if w[1] >= y0-1 and w[3] <= y1+1 and w[0] >= x0-1 and w[2] <= x1+1]
-        # Remove label/phone/email and keep name tokens.
-        name_tokens = []
-        for w in sorted(cw, key=lambda w:(w[1],w[0])):
-            t = w[4]
-            if t.upper() in {"CONSULTOR","DE","VENDAS:"}:
-                continue
-            if "@" in t or re.fullmatch(r"\(\d{2}\)", t) or re.fullmatch(r"\d{4,5}-\d{4}", t):
-                continue
-            if t.upper().startswith("VENDAS"):
-                continue
-            name_tokens.append(w)
-        if name_tokens:
-            # Use only tokens on the first line after the label; this is the name.
-            first_y = min(w[1] for w in name_tokens)
-            line_tokens = [w for w in name_tokens if abs(w[1]-first_y) < 3]
-            name = " ".join(w[4] for w in sorted(line_tokens, key=lambda w:w[0]))
-
-    # Exact editable rectangles from the detected words.
-    name_words = [w for w in words if w[4] == name] if name else []
-    if name_words:
-        name_rect = rect_from_word(name_words[0], 1)
-    else:
-        # Template fallback: name area after label.
-        name_rect = fitz.Rect(275, 108, 375, 123)
-
-    # Phone and email exact rectangles by their words.
-    pw = [w for w in words if w[4] == "(11)" and 100 <= w[1] <= 132]
-    phone_rect = None
-    if pw:
-        p0 = pw[0]
-        # include next phone token
-        nxt = [w for w in words if 100 <= w[1] <= 132 and w[0] > p0[2] and w[0] < p0[2]+80]
-        x1 = max([p0[2]] + [w[2] for w in nxt])
-        phone_rect = fitz.Rect(p0[0]-1, p0[1]-1, x1+1, p0[3]+1)
-    if phone_rect is None:
-        phone_rect = fitz.Rect(495, 109, 578, 122)
-
-    ew = [w for w in words if "@" in w[4] and 100 <= w[1] <= 132]
-    email_rect = rect_from_word(ew[0], 1) if ew else fitz.Rect(495, 121, 580, 132)
-
+def make_cell(page_index, spans, words, style_word, align="left"):
+    """Cria uma célula que cobre `words` e copia fonte/tamanho/cor/linha de base
+    do texto original (style_word)."""
+    x0 = min(w[0] for w in words)
+    y0 = min(w[1] for w in words)
+    x1 = max(w[2] for w in words)
+    y1 = max(w[3] for w in words)
+    s = span_for_word(spans, style_word)
+    if s:
+        bold = bool(s["flags"] & 16) or "bold" in s["font"].lower()
+        size = s["size"]
+        color = _color(s["color"])
+        baseline = s["origin"][1]
+    else:  # plano B
+        bold, size, color, baseline = False, 9.0, (0, 0, 0), y1 - 3
     return {
-        "consultor": name,
-        "phone": phone,
-        "email": email,
-        "name_rect": name_rect,
-        "phone_rect": phone_rect,
-        "email_rect": email_rect,
+        "page": page_index,
+        # área apagada = só a altura real dos glifos (não encosta nas linhas vizinhas)
+        "rect": fitz.Rect(x0 - 0.5, baseline - size * 0.85, x1 + 0.5, baseline + size * 0.25),
+        "x0": x0,
+        "x1": x1,
+        "baseline": baseline,
+        "font": "hebo" if bold else "helv",
+        "size": size,
+        "color": color,
+        "align": align,
     }
 
+
+def money_cell(page_index, spans, words, num_word, align="right"):
+    """Célula do número + o 'R$' que vem logo antes dele (se existir)."""
+    group = [num_word]
+    for w in words:
+        if w[4] == "R$" and abs(w[1] - num_word[1]) < 2.5 and 0 <= num_word[0] - w[2] <= 8:
+            group.insert(0, w)
+            break
+    return make_cell(page_index, spans, group, num_word, align)
+
+
+def write_cells(doc, ops):
+    """ops = [(cell, texto)]. Apaga o original e escreve o novo texto
+    com a mesma fonte, tamanho e linha de base."""
+    by_page = {}
+    for cell, text in ops:
+        by_page.setdefault(cell["page"], []).append((cell, text))
+
+    for pi, items in by_page.items():
+        page = doc[pi]
+        for cell, _ in items:
+            page.add_redact_annot(cell["rect"], fill=False)  # sem pintar: preserva o fundo cinza
+        try:
+            page.apply_redactions(
+                images=fitz.PDF_REDACT_IMAGE_NONE,
+                graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+            )
+        except (TypeError, AttributeError):
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+
+        for cell, text in items:
+            width = fitz.get_text_length(text, fontname=cell["font"], fontsize=cell["size"])
+            x = cell["x1"] - width if cell["align"] == "right" else cell["x0"]
+            page.insert_text(
+                (x, cell["baseline"]), text,
+                fontname=cell["font"], fontsize=cell["size"], color=cell["color"],
+            )
+
+
+# ============================================================
+# Leitura do PDF do Pontta
+# ============================================================
+def detect_header(page):
+    words = page.get_text("words")
+    spans = all_spans(page)
+
+    # Nome: palavras na mesma linha depois de "VENDAS:" (antes da coluna de telefone)
+    name, name_cell = "", None
+    vendas = [w for w in words if w[4].upper().startswith("VENDAS")]
+    if vendas:
+        v = vendas[0]
+        toks = [w for w in words
+                if abs(w[1] - v[1]) < 4 and w[0] > v[2] - 1 and w[2] < 470]
+        toks.sort(key=lambda w: w[0])
+        if toks:
+            name = " ".join(w[4] for w in toks)
+            name_cell = make_cell(0, spans, toks, toks[0], "left")
+
+    # Telefone e e-mail do consultor (coluna da direita, abaixo do telefone principal)
+    right = [w for w in words if w[0] > 470 and 100 <= w[1] <= 135]
+    ph = sorted([w for w in right if re.fullmatch(r"\(\d{2}\)", w[4]) or re.fullmatch(r"\d{4,5}-\d{4}", w[4])],
+                key=lambda w: w[0])
+    phone = " ".join(w[4] for w in ph)
+    phone_cell = make_cell(0, spans, ph, ph[0], "right") if ph else None
+
+    em = [w for w in right if "@" in w[4]]
+    email = em[0][4] if em else ""
+    email_cell = make_cell(0, spans, [em[0]], em[0], "right") if em else None
+
+    return {
+        "consultor": name, "phone": phone, "email": email,
+        "name_cell": name_cell, "phone_cell": phone_cell, "email_cell": email_cell,
+    }
+
+
 def detect_items(doc):
-    """
-    Detect each product from the Pontta table using the Qtd. row as the anchor.
-    This is deliberately coordinate-based instead of block-based because
-    Pontta may put the description on several lines and prices in separate
-    PDF text objects.
-    """
-    items=[]
+    """Cada item é ancorado pela linha 'Qtd. + UN'."""
+    items = []
     for page_index, page in enumerate(doc):
-        words=page.get_text("words")
+        words = page.get_text("words")
+        spans = all_spans(page)
 
-        # Quantity anchors: "1 UN", "2 UN", etc.
-        qty_words=[w for w in words if w[4].upper()=="UN" and 15 <= w[0] <= 80]
-        for un_w in qty_words:
-            # Find numeric quantity immediately before UN.
-            q_candidates=[w for w in words if abs(w[1]-un_w[1])<=2.5 and 15<=w[2]<=un_w[0]+1 and re.fullmatch(r"\d+(?:[.,]\d+)?",w[4])]
-            if not q_candidates:
+        for un_w in [w for w in words if w[4].upper() == "UN" and 15 <= w[0] <= 80]:
+            q = [w for w in words
+                 if abs(w[1] - un_w[1]) <= 2.5 and 15 <= w[2] <= un_w[0] + 1
+                 and re.fullmatch(r"\d+(?:[.,]\d+)?", w[4])]
+            if not q:
                 continue
-            q_w=max(q_candidates,key=lambda w:w[2])
-            qty=float(q_w[4].replace(",", "."))
-            qty_value=int(qty) if qty.is_integer() else qty
-            y=un_w[1]
+            q_w = max(q, key=lambda w: w[2])
+            qty = float(q_w[4].replace(",", "."))
+            qty = int(qty) if qty.is_integer() else qty
+            y = un_w[1]
 
-            # Price pair near the quantity row. Price text can be in a
-            # separate PDF text object, so search by coordinates, not block.
-            unit_candidates=[
-                w for w in words
-                if is_money_number(w[4]) and 400 <= w[0] <= 505 and abs(w[1]-y)<=4
-            ]
-            total_candidates=[
-                w for w in words
-                if is_money_number(w[4]) and 515 <= w[0] <= 590 and abs(w[1]-y)<=4
-            ]
-            if not unit_candidates or not total_candidates:
+            unit_c = [w for w in words if is_money_number(w[4]) and 400 <= w[0] <= 505 and abs(w[1] - y) <= 6]
+            total_c = [w for w in words if is_money_number(w[4]) and 515 <= w[0] <= 590 and abs(w[1] - y) <= 6]
+            if not unit_c or not total_c:
                 continue
-            unit_w=min(unit_candidates,key=lambda w:abs(w[1]-y))
-            total_w=min(total_candidates,key=lambda w:abs(w[1]-y))
+            unit_w = min(unit_c, key=lambda w: abs(w[1] - y))
+            total_w = min(total_c, key=lambda w: abs(w[1] - y))
 
-            # Description: collect words in the item column around the
-            # quantity row, allowing the first description to wrap.
-            # Stop before the configuration paragraph below the item.
-            desc_words=[]
-            for w in words:
-                if not (125 <= w[0] < 415):
-                    continue
-                if y-12 <= w[1] <= y+5:
-                    t=w[4]
-                    if t not in {"R$"} and not is_money_number(t):
-                        desc_words.append(w)
-
-            # First item may have a wrapped second line at y+5.5 to +15.
-            for w in words:
-                if not (125 <= w[0] < 415):
-                    continue
-                if y+5 < w[1] <= y+16:
-                    t=w[4]
-                    if t not in {"R$"} and not is_money_number(t):
-                        desc_words.append(w)
-
-            desc_words.sort(key=lambda w:(w[1],w[0]))
-            description=" ".join(w[4] for w in desc_words).strip()
-            # Remove accidental header/configuration tokens if any.
+            desc = [w for w in words
+                    if 125 <= w[0] < 415 and y - 12 <= w[1] <= y + 16
+                    and w[4] != "R$" and not is_money_number(w[4])]
+            desc.sort(key=lambda w: (round(w[1]), w[0]))
+            description = " ".join(w[4] for w in desc).strip()
             if "Configuração" in description:
-                description=description.split("Configuração",1)[0].strip()
-
+                description = description.split("Configuração", 1)[0].strip()
             if not description:
                 continue
-
-            # Do not treat payment/finance rows as products.
-            low=description.lower()
-            if any(k in low for k in ["condição:", "pagamento:", "descontos", "valor líquido"]):
+            if any(k in description.lower() for k in ["condição:", "pagamento:", "descontos", "valor líquido"]):
                 continue
 
             items.append({
-                "page":page_index,
-                "y":y,
-                "qty":qty_value,
-                "description":description,
-                "unit":parse_number(unit_w[4]),
-                "total":parse_number(total_w[4]),
-                "unit_rect":rect_from_word(unit_w,1),
-                "total_rect":rect_from_word(total_w,1),
+                "page": page_index, "y": y, "qty": qty, "description": description,
+                "unit": parse_number(unit_w[4]), "total": parse_number(total_w[4]),
+                "unit_cell": money_cell(page_index, spans, words, unit_w),
+                "total_cell": money_cell(page_index, spans, words, total_w),
             })
 
-    # Deduplicate using quantity row + description.
-    unique=[]
-    seen=set()
-    for item in sorted(items,key=lambda x:(x["page"],x["y"])):
-        key=(item["page"],round(item["y"],1),item["description"])
-        if key in seen: continue
-        seen.add(key)
-        unique.append(item)
+    unique, seen = [], set()
+    for it in sorted(items, key=lambda x: (x["page"], x["y"])):
+        key = (it["page"], round(it["y"], 1), it["description"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(it)
     return unique
 
+
 def detect_finance(doc):
-    page_index=len(doc)-1
-    page=doc[page_index]
-    words=page.get_text('words')
+    pi = len(doc) - 1
+    page = doc[pi]
+    words = page.get_text("words")
+    spans = all_spans(page)
 
-    def find_finance_value(label):
-        labels=[w for w in words if w[4].lower()==label.lower()]
-        if not labels: return None
-        lab=labels[0]; y=lab[1]
-        # Find the numeric value on the same visual row, regardless of whether
-        # the R$ token is between label and number.
-        nums=[w for w in words if is_money_number(w[4]) and abs(w[1]-y)<=2.0 and w[0]>490]
-        nums.sort(key=lambda w:w[0])
-        return nums[0] if nums else None
+    def find_row(label):
+        """Procura o rótulo que tem um valor em dinheiro na mesma linha
+        (ignora o 'Total' do cabeçalho da tabela de itens)."""
+        best = None
+        for lab in [w for w in words if w[4].lower() == label.lower()]:
+            nums = sorted([w for w in words if is_money_number(w[4])
+                           and abs(w[1] - lab[1]) <= 2.5 and w[0] > lab[2]],
+                          key=lambda w: w[0])
+            if nums and (best is None or lab[1] > best[0][1]):
+                best = (lab, nums[0])
+        return best
 
-    total_w=find_finance_value('Total')
-    frete_w=find_finance_value('Frete')
-    desc_w=find_finance_value('Descontos')
-    liquid_w=find_finance_value('líquido')
+    def cell_for(label):
+        r = find_row(label)
+        if not r:
+            return None, 0.0
+        return money_cell(pi, spans, words, r[1]), parse_number(r[1][4])
 
-    pct_w=None
-    desc_labels=[w for w in words if w[4].lower().startswith('descont')]
-    if desc_labels:
-        y=desc_labels[0][1]
-        pcts=[w for w in words if abs(w[1]-y)<=2.5 and re.fullmatch(r'\(\d+(?:,\d+)?%\)',w[4])]
-        if pcts: pct_w=pcts[0]
+    total_cell, _ = cell_for("Total")
+    frete_cell, frete = cell_for("Frete")
+    liquido_cell, liquido = cell_for("líquido")
 
-    blocks=page.get_text('blocks')
-    condition=''; payment=''; condition_blocks=[]; payment_blocks=[]
-    for bl in blocks:
-        txt=bl[4].strip()
-        if txt.startswith('Condição:'):
-            if not condition: condition=txt.splitlines()[0].replace('Condição:','',1).strip()
-            condition_blocks.append(fitz.Rect(bl[0],bl[1],bl[2],bl[3]))
-        elif txt.startswith('Pagamento:'):
-            if not payment: payment=txt.splitlines()[0].replace('Pagamento:','',1).strip()
-            payment_blocks.append(fitz.Rect(bl[0],bl[1],bl[2],bl[3]))
-
-    summary_groups=[]
-    for rect in payment_blocks:
-        vals=[]
+    # Descontos: "- R$ 2.504,32 (28%)" é tratado como uma única célula
+    desc_cell, desconto, desc_pct, has_pct = None, 0.0, "", False
+    r = find_row("Descontos")
+    if r:
+        lab, num = r
+        pct_w = next((w for w in words if abs(w[1] - lab[1]) <= 2.5 and w[0] > num[2] - 1
+                      and re.fullmatch(r"\(\d+(?:,\d+)?%\)", w[4])), None)
+        group = [num]
         for w in words:
-            if is_money_number(w[4]) and rect.y0-1<=w[1]<=rect.y1+1 and w[0]>=rect.x0-1:
-                vals.append({'rect':rect_from_word(w,1),'x':w[0],'y':w[1]})
-        vals.sort(key=lambda r:r['x'])
-        if vals: summary_groups.append(vals)
+            if w[4] == "R$" and abs(w[1] - num[1]) < 2.5 and 0 <= num[0] - w[2] <= 8:
+                group.insert(0, w)
+                break
+        if pct_w:
+            group.append(pct_w)
+            has_pct = True
+            desc_pct = re.sub(r"[()%]", "", pct_w[4])
+        desc_cell = make_cell(pi, spans, group, num, "right")
+        desconto = parse_number(num[4])
 
-    payment_rows=[]
-    for date_w in words:
-        if not re.fullmatch(r'\d{2}/\d{2}/\d{4}',date_w[4]): continue
-        y=date_w[1]
-        # Any R$ token and money number to its right on the same row.
-        amounts=[w for w in words if is_money_number(w[4]) and abs(w[1]-y)<=2.0 and 150<w[0]<270]
-        if not amounts: continue
-        aw=min(amounts,key=lambda w:w[0])
-        payment_rows.append({'page':page_index,'amount':parse_number(aw[4]),'rect':rect_from_word(aw,1),'date':date_w[4],'y':y})
-    payment_rows.sort(key=lambda r:r['y'])
-    clean=[]; seen=set()
-    for r in payment_rows:
-        k=round(r['y'],1)
-        if k not in seen: seen.add(k); clean.append(r)
+    # Condição e linha "Pagamento: 1x R$ ..."
+    condition = ""
+    for b in page.get_text("blocks"):
+        for line in b[4].splitlines():
+            if line.strip().startswith("Condição:"):
+                condition = line.split("Condição:", 1)[1].strip()
+                break
+        if condition:
+            break
+
+    summary_cells = []
+    lab = next((w for w in words if w[4].startswith("Pagamento:")), None)
+    if lab:
+        for w in sorted(words, key=lambda w: w[0]):
+            if is_money_number(w[4]) and abs(w[1] - lab[1]) <= 2.5 and w[0] > lab[2]:
+                summary_cells.append(money_cell(pi, spans, words, w, "left"))
+
+    # Tabela de parcelas
+    rows, seen = [], set()
+    for d in words:
+        if not re.fullmatch(r"\d{2}/\d{2}/\d{4}", d[4]):
+            continue
+        amounts = [w for w in words if is_money_number(w[4]) and abs(w[1] - d[1]) <= 2.5 and 150 < w[0] < 400]
+        if not amounts:
+            continue
+        aw = min(amounts, key=lambda w: w[0])
+        k = round(d[1], 1)
+        if k in seen:
+            continue
+        seen.add(k)
+        rows.append({"y": d[1], "amount": parse_number(aw[4]), "cell": money_cell(pi, spans, words, aw)})
+    rows.sort(key=lambda r: r["y"])
 
     return {
-        'page':page_index,
-        'total_rect':rect_from_word(total_w,1) if total_w else None,
-        'frete_rect':rect_from_word(frete_w,1) if frete_w else None,
-        'desconto_rect':rect_from_word(desc_w,1) if desc_w else None,
-        'desconto_pct_rect':rect_from_word(pct_w,1) if pct_w else None,
-        'liquido_rect':rect_from_word(liquid_w,1) if liquid_w else None,
-        'desconto_pct':re.sub(r'[()%]','',pct_w[4]) if pct_w else '',
-        'condition':condition,'payment':payment,'condition_blocks':condition_blocks,
-        'payment_blocks':payment_blocks,'summary_groups':summary_groups,'payment_rows':clean,
-        'frete':parse_number(frete_w[4]) if frete_w else 0,
-        'desconto':parse_number(desc_w[4]) if desc_w else 0,
-        'liquido':parse_number(liquid_w[4]) if liquid_w else 0,
+        "page": pi,
+        "total_cell": total_cell, "frete_cell": frete_cell,
+        "desc_cell": desc_cell, "liquido_cell": liquido_cell,
+        "desconto_pct": desc_pct, "has_pct": has_pct,
+        "condition": condition,
+        "summary_cells": summary_cells, "payment_rows": rows,
+        "frete": frete, "desconto": desconto, "liquido": liquido,
     }
 
 
 def parse_pdf(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    first_page = doc[0]
-    header = detect_header(first_page)
-    items = detect_items(doc)
-    finance = detect_finance(doc)
-    data = {
-        "header": header,
-        "items": items,
-        "finance": finance,
-        "doc_pages": len(doc),
+    try:
+        return {
+            "header": detect_header(doc[0]),
+            "items": detect_items(doc),
+            "finance": detect_finance(doc),
+            "doc_pages": len(doc),
+        }
+    finally:
+        doc.close()
+
+
+# ============================================================
+# Cálculo (usado tanto na conferência quanto no PDF)
+# ============================================================
+def calc_finance(items, frete_txt, pct_txt, desc_txt, orig_desc_txt):
+    """Retorna dict com total, frete, desconto, pct e líquido.
+    Se o usuário mudou o campo Desconto (R$), ele vale; senão vale o %."""
+    total = round(sum(float(it["qty"]) * money_float(it["unit"]) for it in items), 2)
+    frete = round(money_float(frete_txt), 2)
+    desc_changed = str(desc_txt).strip() != str(orig_desc_txt).strip()
+
+    if desc_changed:
+        desconto = round(money_float(desc_txt), 2)
+        pct = (desconto / total * 100) if total else 0.0
+    elif str(pct_txt).strip():
+        pct = money_float(pct_txt)
+        desconto = round(total * pct / 100, 2)
+    else:
+        desconto = round(money_float(desc_txt), 2)
+        pct = (desconto / total * 100) if total else 0.0
+
+    return {
+        "total": total, "frete": frete, "desconto": desconto, "pct": pct,
+        "liquido": round(total + frete - desconto, 2),
     }
-    doc.close()
-    return data
 
-# ============================================================
-# Edição mantendo o PDF original
-# ============================================================
-def replace_word(page, rect, text, font="helv", size=8.0, align=0):
-    if rect is None:
-        return
-    page.add_redact_annot(fitz.Rect(rect), fill=(1,1,1))
-    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-    page.insert_textbox(
-        fitz.Rect(rect), str(text),
-        fontname=font, fontsize=size, color=(0,0,0),
-        align=align, lineheight=1.0, overlay=True
-    )
-
-def update_payment_text(page, rect, new_text):
-    if rect is None:
-        return
-    # Replace the entire payment line because the number of installments
-    # and their values may change when the liquid amount changes.
-    page.add_redact_annot(rect, fill=(1,1,1))
-    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-    page.insert_textbox(rect, new_text, fontname="helv", fontsize=7.5,
-                        color=(0,0,0), align=0, lineheight=1.0, overlay=True)
 
 def parse_payment_percentages(condition):
-    """Read the payment percentages from Pontta conditions like:
-    34% Sinal + 33 a 28 DDF + 33% a 56 DDF
-    The middle installment intentionally may omit the % sign.
-    """
-    parts = [p.strip() for p in str(condition).split("+") if p.strip()]
+    """'34% Sinal + 33 a 28 DDF + 33% a 56 DDF' -> [34, 33, 33]"""
     vals = []
-    for part in parts:
-        m = re.match(r"^(\d+(?:[.,]\d+)?)", part)
+    for part in str(condition).split("+"):
+        m = re.match(r"^\s*(\d+(?:[.,]\d+)?)", part)
         if m:
             vals.append(float(m.group(1).replace(",", ".")))
     return vals
 
-def generate_pdf(pdf_bytes, d):
+
+def split_payments(liquido, percents, n_rows):
+    if not n_rows:
+        return []
+    if not percents:
+        return [liquido] if n_rows == 1 else []
+    n = min(len(percents), n_rows)
+    amounts, remaining = [], liquido
+    for i in range(n):
+        if i == n - 1:
+            a = round(remaining, 2)
+        else:
+            a = round(liquido * percents[i] / 100, 2)
+            remaining = round(remaining - a, 2)
+        amounts.append(a)
+    return amounts
+
+
+# ============================================================
+# Geração do PDF editado
+# ============================================================
+def generate_pdf(pdf_bytes, parsed, d):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    warnings = []
+    ops = []
 
     # 1) Cabeçalho
-    p0 = doc[0]
-    h = d["header"]
-    replace_word(p0, h["name_rect"], d["consultor"], "hebo", 8.5)
-    replace_word(p0, h["phone_rect"], d["phone"], "helv", 8.0, align=2)
-    replace_word(p0, h["email_rect"], d["email"], "helv", 7.7, align=2)
+    h = parsed["header"]
+    if h["name_cell"]:
+        ops.append((h["name_cell"], d["consultor"]))
+    if h["phone_cell"]:
+        ops.append((h["phone_cell"], d["phone"]))
+    if h["email_cell"]:
+        ops.append((h["email_cell"], d["email"]))
 
     # 2) Itens
-    total = 0.0
-    for item in d["items"]:
-        page = doc[item["page"]]
-        qty = int(item["qty"])
-        unit = round(money_float(item["unit"]), 2)
-        item_total = round(qty * unit, 2)
-        total = round(total + item_total, 2)
-        replace_word(page, item["unit_rect"], money(unit), "helv", 7.8, align=2)
-        replace_word(page, item["total_rect"], money(item_total), "helv", 7.8, align=2)
+    for it in d["items"]:
+        unit = round(money_float(it["unit"]), 2)
+        item_total = round(float(it["qty"]) * unit, 2)
+        ops.append((it["unit_cell"], "R$ " + money(unit)))
+        ops.append((it["total_cell"], "R$ " + money(item_total)))
 
     # 3) Financeiro
-    f = d["finance"]
-    frete = round(money_float(d["frete"]), 2)
-    if str(d["desconto_pct"]).strip():
-        pct = float(str(d["desconto_pct"]).replace(",", "."))
-        desconto = round(total * pct / 100, 2)
+    f = parsed["finance"]
+    calc = calc_finance(d["items"], d["frete"], d["desconto_pct"], d["desconto"], d["orig_desconto"])
+    if f["total_cell"]:
+        ops.append((f["total_cell"], "R$ " + money(calc["total"])))
     else:
-        pct = None
-        desconto = round(money_float(d["desconto"]), 2)
-    liquido = round(total + frete - desconto, 2)
+        warnings.append("Não encontrei o campo Total no PDF.")
+    if f["frete_cell"]:
+        ops.append((f["frete_cell"], "R$ " + money(calc["frete"])))
+    if f["desc_cell"]:
+        txt = "R$ " + money(calc["desconto"])
+        if f["has_pct"]:
+            txt += f" ({pct_text(calc['pct'])}%)"
+        ops.append((f["desc_cell"], txt))
+    if f["liquido_cell"]:
+        ops.append((f["liquido_cell"], "R$ " + money(calc["liquido"])))
+    else:
+        warnings.append("Não encontrei o campo Valor líquido no PDF.")
 
-    fp = doc[f["page"]]
-    replace_word(fp, f["total_rect"], money(total), "hebo", 8.0, align=2)
-    replace_word(fp, f["frete_rect"], money(frete), "helv", 8.0, align=2)
-    replace_word(fp, f["desconto_rect"], money(desconto), "helv", 8.0, align=2)
-    if f.get("desconto_pct_rect") and pct is not None:
-        pct_text = f"({int(pct) if float(pct).is_integer() else str(pct).replace('.', ',')}%)"
-        replace_word(fp, f["desconto_pct_rect"], pct_text, "helv", 8.0, align=2)
-    replace_word(fp, f["liquido_rect"], money(liquido), "hebo", 8.3, align=2)
+    # 4) Pagamento: atualiza apenas os números existentes
+    percents = parse_payment_percentages(d["condition"])
+    rows = f["payment_rows"]
+    amounts = split_payments(calc["liquido"], percents, len(rows))
+    if percents and len(percents) != len(rows):
+        warnings.append(
+            f"A condição tem {len(percents)} parcela(s), mas o PDF tem {len(rows)} linha(s) de parcela. "
+            "Só as linhas existentes foram atualizadas."
+        )
+    if percents and abs(sum(percents) - 100) > 0.01:
+        warnings.append(f"As porcentagens da condição somam {pct_text(sum(percents))}%, não 100%.")
 
-    # 4) Pagamento
-    # IMPORTANT: do not create a new Condition/Pagamento block.
-    # The Pontta template moves this block depending on the number of items.
-    # We preserve its original position and replace only existing numbers.
-    condition = d["condition"]
-    percents = parse_payment_percentages(condition)
-    rows = f.get("payment_rows", [])
+    for row, a in zip(rows, amounts):
+        ops.append((row["cell"], "R$ " + money(a)))
+    for cell, a in zip(f["summary_cells"], amounts):
+        ops.append((cell, "R$ " + money(a)))
 
-    if percents and rows:
-        n = min(len(percents), len(rows))
-        amounts=[]; remaining=liquido
-        for i in range(n):
-            if i == n-1:
-                amount=round(remaining,2)
-            else:
-                amount=round(liquido*percents[i]/100,2)
-                remaining=round(remaining-amount,2)
-            amounts.append(amount)
-
-        # Update the payment table.
-        for row, amount in zip(rows[:n], amounts):
-            replace_word(fp, row["rect"], money(amount), "helv", 7.6, align=2)
-
-        # Update every existing "Pagamento:" summary line in place.
-        # No labels, dates or condition text are touched.
-        for group in f.get("summary_groups", []):
-            for rect_info, amount in zip(group[:n], amounts):
-                replace_word(fp, rect_info["rect"], money(amount), "hebo", 7.5)
+    write_cells(doc, ops)
 
     out = io.BytesIO()
     doc.save(out, garbage=4, deflate=True)
     doc.close()
-    return out.getvalue()
+    return out.getvalue(), warnings
+
 
 # ============================================================
 # Interface
@@ -473,12 +470,12 @@ uploaded = st.file_uploader("Envie o orçamento original exportado do Pontta", t
 
 if uploaded:
     pdf_bytes = uploaded.getvalue()
-    import hashlib
-    upload_signature = hashlib.sha256(pdf_bytes).hexdigest()
-    if st.session_state.get("_upload_signature") != upload_signature:
-        st.session_state["_upload_signature"] = upload_signature
-        st.session_state.pop("result_pdf", None)
-        st.session_state.pop("result_name", None)
+    sig = hashlib.sha256(pdf_bytes).hexdigest()[:12]  # chaves únicas por PDF
+
+    if st.session_state.get("_upload_signature") != sig:
+        st.session_state["_upload_signature"] = sig
+        st.session_state.pop("result", None)
+
     try:
         parsed = parse_pdf(pdf_bytes)
     except Exception as e:
@@ -486,99 +483,86 @@ if uploaded:
         st.stop()
 
     st.success(f"Encontrados {len(parsed['items'])} item(ns) em {parsed['doc_pages']} página(s).")
-
     if not parsed["items"]:
         st.error("Não consegui localizar os itens deste PDF. Nenhum PDF será gerado para evitar alterar o orçamento incorretamente.")
         st.stop()
 
-    with st.form("editor"):
-        st.subheader("Consultor de vendas")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            consultor = st.text_input("Nome", parsed["header"]["consultor"])
-        with c2:
-            phone = st.text_input("Telefone", parsed["header"]["phone"])
-        with c3:
-            email = st.text_input("E-mail", parsed["header"]["email"])
+    hd, fin = parsed["header"], parsed["finance"]
 
-        st.subheader("Valores dos itens")
-        st.caption("Altere somente o valor unitário. O total de cada item e o total do orçamento serão recalculados usando a quantidade original.")
+    st.subheader("Consultor de vendas")
+    c1, c2, c3 = st.columns(3)
+    consultor = c1.text_input("Nome", hd["consultor"], key=f"nome_{sig}")
+    phone = c2.text_input("Telefone", hd["phone"], key=f"tel_{sig}")
+    email = c3.text_input("E-mail", hd["email"], key=f"mail_{sig}")
 
-        edited_items = []
-        for i, item in enumerate(parsed["items"], 1):
-            a, b, c = st.columns([0.55, 0.20, 0.25])
-            with a:
-                st.write(f"**{i}. {item['description']}**")
-            with b:
-                st.write(f"{item['qty']} UN")
-            with c:
-                item_key = f"unit_{item["page"]}_{round(item["y"])}_{i}"
-                unit = st.text_input("Valor unitário", money(item["unit"]), key=item_key)
-            edited_items.append({**item, "unit": unit})
+    st.subheader("Valores dos itens")
+    st.caption("Altere somente o valor unitário. O total de cada item e o total do orçamento são recalculados com a quantidade original.")
+    edited_items = []
+    for i, item in enumerate(parsed["items"], 1):
+        a, b, c = st.columns([0.55, 0.20, 0.25])
+        a.write(f"**{i}. {item['description']}**")
+        b.write(f"{item['qty']} UN")
+        unit = c.text_input("Valor unitário", money(item["unit"]), key=f"unit_{sig}_{item['page']}_{i}")
+        edited_items.append({**item, "unit": unit})
 
-        st.subheader("Financeiro")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            frete = st.text_input("Frete", money(parsed["finance"]["frete"]))
-        with c2:
-            desconto_pct = st.text_input("Desconto (%)", parsed["finance"]["desconto_pct"])
-        with c3:
-            desconto = st.text_input("Desconto (R$)", money(parsed["finance"]["desconto"]))
+    st.subheader("Financeiro")
+    orig_desc_txt = money(fin["desconto"])
+    c1, c2, c3 = st.columns(3)
+    frete = c1.text_input("Frete", money(fin["frete"]), key=f"frete_{sig}")
+    desconto_pct = c2.text_input("Desconto (%)", fin["desconto_pct"], key=f"dpct_{sig}")
+    desconto = c3.text_input("Desconto (R$)", orig_desc_txt, key=f"dval_{sig}")
+    st.caption("Para dar desconto em %, altere o campo (%). Para dar desconto em reais, altere o campo (R$); nesse caso o (%) é recalculado.")
 
-        st.subheader("Pagamento")
-        condition = st.text_input("Condição de pagamento", parsed["finance"]["condition"])
+    st.subheader("Pagamento")
+    condition = st.text_input("Condição de pagamento", fin["condition"], key=f"cond_{sig}")
 
-        # Live calculation preview
-        preview_total = sum(int(it["qty"]) * money_float(it["unit"]) for it in edited_items)
-        preview_frete = money_float(frete)
-        preview_pct = money_float(desconto_pct)
-        preview_desconto = round(preview_total * preview_pct / 100, 2) if desconto_pct.strip() else money_float(desconto)
-        preview_liquido = round(preview_total + preview_frete - preview_desconto, 2)
+    calc = calc_finance(edited_items, frete, desconto_pct, desconto, orig_desc_txt)
+    percents = parse_payment_percentages(condition)
+    amounts = split_payments(calc["liquido"], percents, len(fin["payment_rows"]))
 
-        st.markdown("### Conferência antes de gerar")
-        pc1, pc2, pc3, pc4 = st.columns(4)
-        pc1.metric("Total", f"R$ {money(preview_total)}")
-        pc2.metric("Frete", f"R$ {money(preview_frete)}")
-        pc3.metric("Desconto", f"R$ {money(preview_desconto)}")
-        pc4.metric("Valor líquido", f"R$ {money(preview_liquido)}")
+    st.markdown("### Conferência antes de gerar")
+    pc1, pc2, pc3, pc4 = st.columns(4)
+    pc1.metric("Total", f"R$ {money(calc['total'])}")
+    pc2.metric("Frete", f"R$ {money(calc['frete'])}")
+    pc3.metric("Desconto", f"R$ {money(calc['desconto'])} ({pct_text(calc['pct'])}%)")
+    pc4.metric("Valor líquido", f"R$ {money(calc['liquido'])}")
+    if amounts:
+        st.caption("Parcelas: " + " + ".join(f"R$ {money(a)}" for a in amounts))
 
+    state = repr((consultor, phone, email, [it["unit"] for it in edited_items],
+                  frete, desconto_pct, desconto, condition))
 
-        submitted = st.form_submit_button("📄 GERAR PDF EDITADO", type="primary", use_container_width=True)
-
-    if submitted:
+    if st.button("📄 GERAR PDF EDITADO", type="primary", use_container_width=True):
         d = {
-            "header": parsed["header"],
-            "consultor": consultor,
-            "phone": phone,
-            "email": email,
-            "items": edited_items,
-            "frete": frete,
-            "desconto_pct": desconto_pct,
-            "desconto": desconto,
-            "condition": condition,
-            "finance": parsed["finance"],
+            "consultor": consultor, "phone": phone, "email": email,
+            "items": edited_items, "frete": frete,
+            "desconto_pct": desconto_pct, "desconto": desconto,
+            "orig_desconto": orig_desc_txt, "condition": condition,
         }
         try:
-            result = generate_pdf(pdf_bytes, d)
-            st.session_state["result_pdf"] = result
-            st.session_state["result_name"] = "Orçamento - EDITADO.pdf"
-            st.success("PDF gerado com os valores recalculados.")
+            data, warns = generate_pdf(pdf_bytes, parsed, d)
+            st.session_state["result"] = {"pdf": data, "state": state, "warnings": warns}
         except Exception as e:
             st.exception(e)
 
-    if "result_pdf" in st.session_state:
-        st.download_button(
-            "⬇️ Baixar PDF editado",
-            data=st.session_state["result_pdf"],
-            file_name=st.session_state["result_name"],
-            mime="application/pdf",
-            use_container_width=True,
-        )
-        b64 = base64.b64encode(st.session_state["result_pdf"]).decode()
-        st.markdown(
-            f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="850" '
-            'style="border:1px solid #ddd;border-radius:8px;"></iframe>',
-            unsafe_allow_html=True,
-        )
+    res = st.session_state.get("result")
+    if res:
+        if res["state"] != state:
+            st.warning("Você alterou valores depois de gerar. Clique em GERAR PDF EDITADO novamente.")
+        else:
+            st.success("PDF gerado com os valores recalculados.")
+            for w in res["warnings"]:
+                st.warning(w)
+            st.download_button(
+                "⬇️ Baixar PDF editado", data=res["pdf"],
+                file_name="Orçamento - EDITADO.pdf", mime="application/pdf",
+                use_container_width=True,
+            )
+            b64 = base64.b64encode(res["pdf"]).decode()
+            st.markdown(
+                f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="850" '
+                'style="border:1px solid #ddd;border-radius:8px;"></iframe>',
+                unsafe_allow_html=True,
+            )
 else:
     st.info("Envie o PDF original do Pontta para começar.")
